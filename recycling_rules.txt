@@ -1,0 +1,18 @@
+Send only clearly recyclable items to recycling. Everything else goes to trash.
+
+Conservative starter acceptance list (edit for your collection facility):
+- Clean, dry, uncoated ordinary paper or cardboard without food/grease residue.
+- Empty, visibly clean metal food or beverage cans.
+- Empty, visibly clean glass bottles or jars, intact and without non-glass contents.
+- Empty, visibly clean rigid plastic food/drink bottles or containers only when
+  a visible resin code identifies PET (#1) or HDPE (#2).
+
+Trash: dirty/greasy/wet items, food, tissues, paper towels, coated/lined cups,
+  plastic bags/films/wrappers, foam, ceramics, mirrors, mixed-material packaging,
+  and any item whose material, cleanliness, or acceptance cannot be established.
+  Do not assume that an unreadable or hidden plastic code is #1 or #2.
+
+Hold for inspection instead of pushing: hazardous objects (batteries,
+  electronics, chemicals, broken glass), multiple separate items, obstructing
+  hands/people, or an image too poor to establish that an item is present.
+  An empty platform has decision="empty" and must not be pushed.
