@@ -1,17 +1,20 @@
 """Exercise dashboard state and HTTP routes without a server or camera."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
 import cv2
 import numpy as np
 
+from bin_config import BinConfig, BinDefinition
 from dashboard import DashboardState, create_app
 
 
-def item_record(item_id="item-1", capture_id="capture-1", decision="trash", **extra):
+def item_record(item_id="item-1", capture_id="capture-1", decision="B", **extra):
     return {
         "item_id": item_id,
         "capture_id": capture_id,
@@ -50,12 +53,12 @@ class DashboardStateTests(unittest.TestCase):
     def test_item_retries_update_one_history_item_and_its_counts(self):
         _, epoch = self.state.claim_next_item()
         self.state.record_result(item_record(), epoch)
-        self.state.record_result(item_record(capture_id="capture-2", decision="recycle"), epoch)
+        self.state.record_result(item_record(capture_id="capture-2", decision="A"), epoch)
         snapshot = self.state.get_snapshot()
-        self.assertEqual(snapshot["counts"], {"trash": 0, "recycle": 1, "total": 1})
+        self.assertEqual(snapshot["counts"], {"B": 0, "A": 1, "total": 1})
         self.assertEqual(len(snapshot["items"]), 1)
         self.assertEqual(snapshot["items"][0]["capture_id"], "capture-2")
-        self.assertEqual(snapshot["latest_result"]["decision"], "recycle")
+        self.assertEqual(snapshot["latest_result"]["decision"], "A")
 
     def test_capture_id_deduplicates_records_without_item_id(self):
         _, epoch = self.state.claim_next_item()
@@ -69,24 +72,47 @@ class DashboardStateTests(unittest.TestCase):
     def test_history_and_counts_survive_restart(self):
         _, epoch = self.state.claim_next_item()
         self.state.record_result(item_record(), epoch)
-        self.state.record_result(item_record(item_id="item-2", capture_id="capture-2", decision="recycle"), epoch)
+        self.state.record_result(item_record(item_id="item-2", capture_id="capture-2", decision="A"), epoch)
         self.state.close()
         restarted = DashboardState(self.history_file)
         try:
             snapshot = restarted.get_snapshot()
-            self.assertEqual(snapshot["counts"], {"trash": 1, "recycle": 1, "total": 2})
+            self.assertEqual(snapshot["counts"], {"B": 1, "A": 1, "total": 2})
             self.assertEqual({item["item_id"] for item in snapshot["items"]}, {"item-1", "item-2"})
         finally:
             restarted.close()
 
+    def test_legacy_history_keeps_original_labels_when_current_bins_have_custom_names(self):
+        self.state.close()
+        with sqlite3.connect(str(self.history_file)) as database:
+            for item_id, decision in [("old-recycling", "recycle"), ("old-trash", "trash")]:
+                record = item_record(item_id=item_id, capture_id=item_id, decision=decision)
+                database.execute("INSERT INTO history (item_id, record) VALUES (?, ?)", (item_id, json.dumps(record)))
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged parts.",)),
+                  BinDefinition("B", "Reuse", ("Working parts.",))),
+            fallback_bin="A", hold_rules=(),
+        )
+        self.state = DashboardState(self.history_file, custom)
+        snapshot = self.state.get_snapshot()
+        self.assertEqual(snapshot["counts"], {"A": 1, "B": 1, "total": 2})
+        records = {record["item_id"]: record for record in snapshot["items"]}
+        self.assertEqual((records["old-recycling"]["decision"], records["old-recycling"]["bin_name"]), ("A", "Recycling"))
+        self.assertEqual((records["old-trash"]["decision"], records["old-trash"]["bin_name"]), ("B", "Trash"))
+        _, epoch = self.state.claim_next_item()
+        self.state.record_result(item_record(item_id="new", capture_id="new", decision="A"), epoch)
+        latest = self.state.get_snapshot()["latest_result"]
+        self.assertEqual(latest["bin_name"], "Repair")
+
+
     def test_hold_empty_and_dry_run_results_do_not_count_as_sorted_items(self):
         _, epoch = self.state.claim_next_item()
         for record in [item_record(decision="hold"), item_record(decision="empty"),
-                       item_record(decision="recycle", dry_run=True)]:
+                       item_record(decision="A", dry_run=True)]:
             with self.subTest(record=record):
                 self.state.record_result(record, epoch)
                 snapshot = self.state.get_snapshot()
-                self.assertEqual(snapshot["counts"], {"trash": 0, "recycle": 0, "total": 0})
+                self.assertEqual(snapshot["counts"], {"B": 0, "A": 0, "total": 0})
                 self.assertEqual(snapshot["items"], [])
                 self.assertEqual(snapshot["latest_result"]["decision"], record["decision"])
                 self.assertEqual(snapshot["latest_result"]["dry_run"], record["dry_run"])
@@ -98,7 +124,7 @@ class DashboardStateTests(unittest.TestCase):
         self.state.reset_history()
         self.state.record_result(item_record(item_id="late-result"), old_epoch)
         snapshot = self.state.get_snapshot()
-        self.assertEqual(snapshot["counts"], {"trash": 0, "recycle": 0, "total": 0})
+        self.assertEqual(snapshot["counts"], {"B": 0, "A": 0, "total": 0})
         self.assertEqual(snapshot["items"], [])
         self.assertIsNone(snapshot["latest_result"])
         self.assertEqual(snapshot["pending_note"], "A note for the next item.")
@@ -150,7 +176,23 @@ class DashboardRouteTests(unittest.TestCase):
             self.assertIn("text/html", page.content_type)
         response = self.client.get("/api/state")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["counts"], {"trash": 0, "recycle": 0, "total": 0})
+        self.assertEqual(response.get_json()["counts"], {"B": 0, "A": 0, "total": 0})
+
+    def test_state_endpoint_exposes_custom_bin_configuration_and_names(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged parts.",)),
+                  BinDefinition("B", "Reuse", ("Working parts.",))),
+            fallback_bin="A", hold_rules=(),
+        )
+        self.state.close()
+        self.state = DashboardState(Path(self.directory.name) / "custom.sqlite3", custom)
+        client = create_app(self.state).test_client()
+        _, epoch = self.state.claim_next_item()
+        self.state.record_result(item_record(decision="B"), epoch)
+        snapshot = client.get("/api/state").get_json()
+        self.assertEqual(snapshot["bin_config"], custom.to_dict())
+        self.assertEqual(snapshot["counts"], {"A": 0, "B": 1, "total": 1})
+        self.assertEqual(snapshot["latest_result"]["bin_name"], "Reuse")
 
     def test_next_item_note_endpoint_accepts_note_at_size_limit(self):
         note = "x" * 2000

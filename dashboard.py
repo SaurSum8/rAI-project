@@ -19,6 +19,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, request, send_file
 from werkzeug.serving import make_server, WSGIRequestHandler
 
+from bin_config import BinConfig, load_bin_config
+
 
 LOG = logging.getLogger("camera_sorter.dashboard")
 MAX_NOTE_LENGTH = 2000
@@ -28,7 +30,8 @@ PAGE = Path(__file__).resolve().parent / "web" / "dashboard.html"
 class DashboardState:
     """Share one camera's frames, next-item note, and history across threads."""
 
-    def __init__(self, history_file: Path):
+    def __init__(self, history_file: Path, bin_config: Optional[BinConfig] = None):
+        self.bin_config = bin_config if bin_config is not None else load_bin_config()
         self.history_file = Path(history_file)
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
@@ -58,6 +61,22 @@ class DashboardState:
             """)
             database.execute("INSERT OR IGNORE INTO metadata VALUES ('epoch', 0)")
             self._epoch = database.execute("SELECT value FROM metadata WHERE name = 'epoch'").fetchone()[0]
+            # Older versions stored destinations as recycle/trash. Preserve their
+            # historical meaning even if the current configuration has new names.
+            legacy_bins = {"recycle": ("A", "Recycling"), "trash": ("B", "Trash")}
+            for sequence, encoded in database.execute("SELECT sequence, record FROM history").fetchall():
+                record = json.loads(encoded)
+                legacy = legacy_bins.get(record.get("decision"))
+                if legacy is not None:
+                    record["decision"] = legacy[0]
+                    if not record.get("bin_name"):
+                        record["bin_name"] = legacy[1]
+                    if "bin_id" in record:
+                        record["bin_id"] = legacy[0]
+                    database.execute(
+                        "UPDATE history SET record = ? WHERE sequence = ?",
+                        (json.dumps(record, ensure_ascii=False, allow_nan=False), sequence),
+                    )
 
     @contextmanager
     def _database(self):
@@ -78,11 +97,12 @@ class DashboardState:
                 rows = database.execute("SELECT record FROM history ORDER BY sequence DESC").fetchall()
             items = [json.loads(row[0]) for row in rows]
             counts = {
-                "trash": sum(item["decision"] == "trash" for item in items),
-                "recycle": sum(item["decision"] == "recycle" for item in items),
-                "total": len(items),
+                "A": sum(item["decision"] == "A" for item in items),
+                "B": sum(item["decision"] == "B" for item in items),
             }
+            counts["total"] = counts["A"] + counts["B"]
             return {
+                "bin_config": self.bin_config.to_dict(),
                 "counts": counts,
                 "items": items,
                 "pending_note": self._pending_note,
@@ -111,7 +131,10 @@ class DashboardState:
             if epoch != self._epoch:
                 return
             stored = deepcopy(record)
-            if stored.get("decision") in ("trash", "recycle") and not stored.get("dry_run", False):
+            if stored.get("decision") in ("A", "B"):
+                if not stored.get("bin_name"):
+                    stored["bin_name"] = self.bin_config.get_bin(stored["decision"]).name
+            if stored.get("decision") in ("A", "B") and not stored.get("dry_run", False):
                 item_id = stored.get("item_id") or stored.get("capture_id")
                 if not isinstance(item_id, str) or not item_id:
                     raise ValueError("A sorted item needs an item_id or capture_id.")

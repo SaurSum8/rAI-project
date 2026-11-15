@@ -16,12 +16,14 @@ import numpy as np
 from openai import OpenAI
 from pydantic import ValidationError
 
+from bin_config import BinConfig, BinDefinition
 from dashboard import DashboardState
 
 from camera_sorter import (
     Classification,
     ChangeDetector,
     DEFAULT_MODEL,
+    build_prompt,
     classify_image,
     crop_frame,
     run_camera,
@@ -31,7 +33,7 @@ from camera_sorter import (
 class ClassificationContractTests(unittest.TestCase):
     def setUp(self):
         self.classification = {
-            "decision": "recycle",
+            "decision": "A",
             "item": "aluminum can",
             "material": "aluminum",
             "confidence": 0.95,
@@ -39,7 +41,8 @@ class ClassificationContractTests(unittest.TestCase):
         }
         self.requests = []
 
-    def classify(self, *, status="completed", refusal=False, model=DEFAULT_MODEL, additional_info=""):
+    def classify(self, *, status="completed", refusal=False, model=DEFAULT_MODEL,
+                 additional_info="", bin_config=None):
         content = (
             {"type": "refusal", "refusal": "Cannot classify this image."}
             if refusal
@@ -72,7 +75,8 @@ class ClassificationContractTests(unittest.TestCase):
             max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(respond)),
         ) as client:
-            return classify_image(client, b"test-jpeg", model, "our acceptance policy", 0.75, additional_info)
+            return classify_image(client, b"test-jpeg", model, "our acceptance policy", 0.75,
+                                  additional_info, bin_config)
 
     def test_real_sdk_sends_image_and_strict_schema_and_parses_result(self):
         result = self.classify()
@@ -88,15 +92,48 @@ class ClassificationContractTests(unittest.TestCase):
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertTrue(request["text"]["format"]["strict"])
 
-    def test_low_confidence_recycling_is_changed_to_trash(self):
+    def test_low_confidence_primary_bin_is_changed_to_default_fallback(self):
         self.classification["confidence"] = 0.74
         result = self.classify()
-        self.assertEqual(result.decision, "trash")
+        self.assertEqual(result.decision, "B")
         self.assertIn("75%", result.reason)
 
     def test_confidence_threshold_is_inclusive(self):
         self.classification["confidence"] = 0.75
-        self.assertEqual(self.classify().decision, "recycle")
+        self.assertEqual(self.classify().decision, "A")
+
+    def test_low_confidence_default_fallback_bin_is_preserved(self):
+        self.classification.update(decision="B", confidence=0.2)
+        self.assertEqual(self.classify().decision, "B")
+
+    def test_custom_fallback_applies_without_assuming_a_recycling_direction(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
+                  BinDefinition("B", "Reuse", ("Working components.",))),
+            fallback_bin="A", hold_rules=(),
+        )
+        self.classification.update(decision="B", confidence=0.3)
+        self.assertEqual(self.classify(bin_config=custom).decision, "A")
+
+    def test_new_response_schema_rejects_legacy_decision_names(self):
+        for old_decision in ("recycle", "trash"):
+            with self.subTest(decision=old_decision):
+                self.classification["decision"] = old_decision
+                with self.assertRaises(ValidationError):
+                    self.classify()
+
+    def test_custom_prompt_uses_only_configured_sorting_restrictions(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components accepted.",)),
+                  BinDefinition("B", "Reuse", ("Working components accepted.",))),
+            fallback_bin="A", hold_rules=(),
+        )
+        prompt = build_prompt(custom)
+        for expected in ("Repair", "Reuse", "Damaged components accepted.", "Working components accepted."):
+            self.assertIn(expected, prompt)
+        self.assertNotIn("recycl", prompt.lower())
+        self.assertNotIn("batter", prompt.lower())
+        self.assertNotIn("food/liquid", prompt.lower())
 
     def test_operational_hold_is_preserved(self):
         self.classification.update(decision="hold", confidence=0.2, reason="A hand obscures the item.")
@@ -189,6 +226,11 @@ class CameraIntegrationTests(unittest.TestCase):
         camera.release.assert_called_once()
 
     def test_async_result_routes_only_when_current_scene_remains_stable(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
+                  BinDefinition("B", "Reuse", ("Working components.",))),
+            fallback_bin="B", hold_rules=(),
+        )
         for scene_changed in (False, True):
             with self.subTest(scene_changed=scene_changed), tempfile.TemporaryDirectory() as directory:
                 last_frame = self.replacement if scene_changed else self.item
@@ -198,7 +240,7 @@ class CameraIntegrationTests(unittest.TestCase):
                                            [self.empty, self.item, self.item, last_frame]] + [(False, None)]
                 completed = Future()
                 completed.set_result(Classification(
-                    decision="recycle", item="can", material="metal", confidence=0.95, reason="Accepted."
+                    decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
                 ))
                 executor = Mock()
                 executor.submit.return_value = completed
@@ -209,10 +251,13 @@ class CameraIntegrationTests(unittest.TestCase):
                         patch("camera_sorter.time.sleep"), \
                         contextlib.redirect_stdout(output):
                     with self.assertRaises(RuntimeError):
-                        run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy")
+                        run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy",
+                                   bin_config=custom)
                 records = [json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]["decision"], "hold" if scene_changed else "recycle")
+                self.assertEqual(records[0]["decision"], "hold" if scene_changed else "A")
+                if not scene_changed:
+                    self.assertEqual(records[0]["bin_name"], "Repair")
                 executor.submit.assert_called_once()
                 camera.release.assert_called_once()
 
@@ -223,7 +268,7 @@ class CameraIntegrationTests(unittest.TestCase):
                   self.item, self.item, self.item, self.item]
         camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
         result = Classification(
-            decision="recycle", item="can", material="metal", confidence=0.95, reason="Accepted."
+            decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
         )
         completions = [Future(), Future()]
         for future in completions:
@@ -240,7 +285,7 @@ class CameraIntegrationTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy")
         records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual([record["decision"] for record in records], ["hold", "recycle"])
+        self.assertEqual([record["decision"] for record in records], ["hold", "A"])
         self.assertEqual(executor.submit.call_count, 2)
 
     def test_failed_api_attempt_emits_hold_without_retrying_unchanged_scene(self):
@@ -281,13 +326,14 @@ class CameraIntegrationTests(unittest.TestCase):
             state = DashboardState(Path(directory) / "history.sqlite3")
             state.set_next_note("First item: clean aluminum can.")
 
-            def complete_request(*args):
-                submitted_notes.append(args[-1])
+            def complete_request(function, client, jpeg, model, prompt, min_confidence,
+                                 additional_info="", bin_config=None):
+                submitted_notes.append(additional_info)
                 if len(submitted_notes) == 1:
                     state.set_next_note("Second item: wax-lined cup.")
                 future = Future()
                 future.set_result(Classification(
-                    decision="trash" if len(submitted_notes) == 3 else "recycle",
+                    decision="B" if len(submitted_notes) == 3 else "A",
                     item="cup" if len(submitted_notes) == 3 else "can",
                     material="paper" if len(submitted_notes) == 3 else "metal",
                     confidence=0.95,
@@ -314,12 +360,12 @@ class CameraIntegrationTests(unittest.TestCase):
                     "Second item: wax-lined cup.",
                 ])
                 records = [json.loads(line) for line in output.getvalue().splitlines()]
-                self.assertEqual([record["decision"] for record in records], ["hold", "recycle", "trash"])
+                self.assertEqual([record["decision"] for record in records], ["hold", "A", "B"])
                 self.assertEqual(records[0]["item_id"], records[1]["item_id"])
                 self.assertNotEqual(records[1]["item_id"], records[2]["item_id"])
                 self.assertEqual([record["additional_info"] for record in records], submitted_notes)
                 snapshot = state.get_snapshot()
-                self.assertEqual(snapshot["counts"], {"trash": 1, "recycle": 1, "total": 2})
+                self.assertEqual(snapshot["counts"], {"B": 1, "A": 1, "total": 2})
                 self.assertEqual(snapshot["pending_note"], "")
             finally:
                 state.close()
