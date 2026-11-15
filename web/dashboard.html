@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f1">
+  <title>Trash &amp; recycling sorter</title>
+  <style>
+    :root { color-scheme: light; --page:#f5f6f1; --surface:#fff; --ink:#1e302c; --muted:#65746e; --line:#e0e6df; --teal:#087568; --teal-soft:#e8f5ee; --amber:#956022; --amber-soft:#faf0df; --danger:#ab4541; --radius:20px; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--page); color:var(--ink); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,textarea { font:inherit; }
+    button { cursor:pointer; }
+    button:disabled { cursor:default; opacity:.5; }
+    button:focus-visible,textarea:focus-visible { outline:3px solid #58a99a; outline-offset:3px; }
+    button { min-height:42px; border-radius:10px; border:1px solid var(--line); padding:9px 15px; background:white; color:var(--ink); font-weight:600; transition:background .15s,border-color .15s; }
+    button:hover:not(:disabled) { background:#f1f5f0; border-color:#becdc2; }
+    .primary { background:var(--teal); color:white; border-color:var(--teal); }
+    .primary:hover:not(:disabled) { background:#075f56; border-color:#075f56; }
+    .danger { color:var(--danger); border-color:#e8d8d4; }
+    .danger:hover:not(:disabled) { background:#fcf0ec; border-color:#d8aaa0; }
+    .shell { max-width:1360px; padding:34px 40px 24px; margin:auto; }
+    .topbar,.brand,.connection,.section-heading,.panel-heading,.row,.history-heading,.form-footer,.latest-heading { display:flex; align-items:center; }
+    .topbar,.section-heading,.panel-heading,.history-heading,.form-footer,.latest-heading { justify-content:space-between; gap:16px; }
+    .brand { gap:11px; font-size:14px; font-weight:650; letter-spacing:.01em; }
+    .brand-mark { display:grid; place-items:center; width:33px; height:33px; border-radius:10px; background:var(--ink); color:#d4ecce; }
+    .brand-mark svg { width:21px; height:21px; }
+    .connection { gap:8px; font-size:12px; color:var(--muted); }
+    .dot { width:7px; height:7px; flex:none; border-radius:50%; background:#a1aaa2; }
+    .connection.connected .dot,.live.online .dot { background:#45a27b; }
+    .intro { margin:37px 0 25px; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:clamp(28px,3.1vw,41px); letter-spacing:-1.3px; line-height:1.15; font-weight:650; }
+    .intro p { margin-top:10px; color:var(--muted); font-size:15px; }
+    .stats { display:grid; grid-template-columns:1fr 1fr 1fr; gap:17px; margin-bottom:25px; }
+    .stat { position:relative; border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); padding:20px 23px; }
+    .stat .label { font-size:13px; font-weight:600; color:var(--muted); }
+    .stat .number { margin-top:7px; font-size:37px; font-weight:650; line-height:1.15; letter-spacing:-1px; font-variant-numeric:tabular-nums; }
+    .stat .caption { font-size:12px; margin-top:5px; color:var(--muted); }
+    .stat .symbol { position:absolute; right:21px; top:20px; display:grid; place-items:center; width:34px; height:34px; border-radius:11px; color:var(--teal); background:var(--teal-soft); }
+    .stat.trash .symbol { color:var(--amber); background:var(--amber-soft); }
+    .stat.total .symbol { background:#f0f3ed; color:#667861; }
+    .symbol svg { width:18px; height:18px; }
+    .workspace { display:grid; grid-template-columns:minmax(0,1.8fr) minmax(295px,1fr); align-items:start; gap:23px; }
+    .panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
+    .panel-heading { padding:20px 22px; }
+    h2 { font-size:16px; font-weight:650; letter-spacing:-.2px; }
+    .subtle { color:var(--muted); font-size:12px; }
+    .panel-heading p { margin-top:3px; }
+    .live { display:flex; align-items:center; gap:7px; border:1px solid var(--line); border-radius:20px; padding:4px 10px; font-size:11px; font-weight:600; white-space:nowrap; color:var(--muted); }
+    .feed { position:relative; background:#182522; aspect-ratio:16/10; display:flex; justify-content:center; align-items:center; overflow:hidden; }
+    .feed img { display:block; width:100%; height:100%; object-fit:contain; }
+    .feed img:not(.ready) { opacity:0; }
+    .feed-placeholder { position:absolute; inset:0; display:flex; justify-content:center; align-items:center; flex-direction:column; gap:9px; color:#c5d2ca; font-size:13px; pointer-events:none; text-align:center; padding:24px; }
+    .feed-placeholder svg { width:33px; height:33px; color:#82998d; }
+    .feed-placeholder[hidden] { display:none; }
+    .feed-tag { position:absolute; left:15px; bottom:15px; color:#e3eae5; font-size:10px; letter-spacing:.05em; text-transform:uppercase; border:1px solid #647469; border-radius:6px; padding:4px 8px; background:#182522b3; }
+    .camera-footer { padding:15px 21px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    #camera-status { font-size:12px; color:var(--muted); }
+    .small-button { min-height:34px; padding:6px 11px; font-size:12px; white-space:nowrap; }
+    .sidebar { display:grid; gap:19px; }
+    .note-panel { padding:22px; }
+    .optional { color:var(--muted); background:#f3f5f0; padding:3px 8px; border-radius:6px; font-size:10px; font-weight:500; }
+    .note-panel .description { color:var(--muted); font-size:13px; margin:10px 0 17px; }
+    label { display:block; font-size:12px; font-weight:600; margin-bottom:7px; }
+    textarea { width:100%; resize:vertical; min-height:117px; max-height:280px; padding:12px; line-height:1.5; color:var(--ink); background:#fbfcf9; border:1px solid #d7dfd5; border-radius:10px; }
+    textarea::placeholder { color:#91a093; }
+    .form-footer { margin:6px 0 13px; font-size:10px; color:var(--muted); align-items:start; }
+    .form-footer span:first-child { max-width:80%; }
+    .note-panel .primary { width:100%; }
+    .queued { border-top:1px solid var(--line); margin-top:18px; padding-top:15px; }
+    .queued .row { justify-content:space-between; gap:10px; }
+    .queued h3 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; font-weight:650; color:var(--muted); }
+    .link-button { border:0; padding:0; min-height:25px; font-size:11px; color:var(--teal); background:none; border-radius:4px; }
+    .link-button:hover:not(:disabled) { background:none; border:0; color:#034f45; text-decoration:underline; }
+    #queued-note { font-size:12px; margin-top:6px; max-height:130px; overflow:auto; overflow-wrap:anywhere; white-space:pre-wrap; }
+    #queued-note.empty { color:var(--muted); }
+    .latest-panel { padding:20px 22px; }
+    .latest-heading h2 { font-size:13px; color:var(--muted); }
+    .badge { display:inline-block; background:#f0f3ed; color:var(--muted); padding:3px 9px; font-size:11px; font-weight:600; border-radius:6px; white-space:nowrap; }
+    .badge.recycle { background:var(--teal-soft); color:var(--teal); }
+    .badge.trash { background:var(--amber-soft); color:var(--amber); }
+    .badge.hold { background:#fbf0e6; color:#935a30; }
+    #latest-name { font-size:19px; font-weight:600; letter-spacing:-.3px; margin-top:13px; overflow-wrap:anywhere; }
+    #latest-reason { color:var(--muted); font-size:12px; margin-top:6px; overflow-wrap:anywhere; }
+    #latest-meta { color:var(--muted); font-size:10px; margin-top:11px; }
+    .history { margin-top:24px; }
+    .history-heading { padding:22px; }
+    .history-heading p { margin-top:4px; }
+    .reset-control { text-align:right; }
+    .reset-control .subtle { display:block; margin-top:5px; font-size:10px; }
+    .table-scroll { overflow-x:auto; }
+    table { border-collapse:collapse; width:100%; min-width:630px; text-align:left; font-size:12px; }
+    th { font-size:10px; font-weight:600; letter-spacing:.05em; color:var(--muted); text-transform:uppercase; background:#fafbf8; padding:12px 22px; border-block:1px solid var(--line); }
+    td { padding:16px 22px; border-bottom:1px solid #edf0e9; vertical-align:top; }
+    tbody tr:last-child td { border-bottom:none; }
+    .item-name { font-weight:600; font-size:13px; overflow-wrap:anywhere; }
+    .item-detail { color:var(--muted); font-size:11px; margin-top:4px; max-width:620px; overflow-wrap:anywhere; }
+    .time,.confidence { white-space:nowrap; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .empty-history { text-align:center; padding:38px 24px 42px; border-top:1px solid var(--line); }
+    .empty-history p:first-child { font-size:14px; font-weight:600; }
+    .empty-history p:last-child { font-size:12px; margin-top:5px; color:var(--muted); }
+    #history-summary { padding:12px 22px; border-top:1px solid var(--line); font-size:11px; color:var(--muted); }
+    .page-footer { display:flex; justify-content:space-between; gap:20px; font-size:11px; color:var(--muted); margin-top:18px; }
+    .feedback { min-height:24px; margin-top:8px; font-size:12px; color:var(--teal); }
+    .feedback.error { color:var(--danger); }
+    .connection-error { margin-bottom:18px; padding:11px 15px; border:1px solid #e8d7c4; border-radius:10px; font-size:12px; color:#845e34; background:#fff8ed; }
+    [hidden] { display:none !important; }
+    @media (min-width:1200px) { .feed { aspect-ratio:16/9; } }
+    @media (max-width:950px) { .shell { padding:25px 24px; } .workspace { grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr); gap:17px; } .panel-heading,.note-panel,.latest-panel { padding:18px; } .camera-footer { align-items:start; flex-direction:column; gap:10px; } }
+    @media (max-width:760px) { .workspace { grid-template-columns:1fr; } .sidebar { grid-template-columns:minmax(0,1.3fr) minmax(0,1fr); align-items:start; } .camera-footer { flex-direction:row; align-items:center; } .stat { padding:17px; } .stat .symbol { right:15px; top:15px; width:27px; height:27px; } .stat .number { font-size:32px; } .stat .caption { font-size:10px; } .intro { margin-top:28px; } }
+    @media (max-width:540px) { .shell { padding:20px 15px; } .brand { font-size:12px; } .connection { font-size:10px; } .stats { gap:9px; margin-bottom:17px; } .stat { border-radius:14px; padding:14px 12px; } .stat .symbol { display:none; } .stat .label { font-size:11px; } .stat .number { font-size:29px; } .sidebar { grid-template-columns:1fr; } .history-heading { padding:18px; align-items:start; flex-direction:column; } .reset-control { text-align:left; } .history-heading p { max-width:290px; } th,td { padding:12px 16px; } .page-footer { flex-direction:column; gap:4px; } .camera-footer { padding:14px 17px; } h1 { letter-spacing:-.8px; } }
+    @media (prefers-reduced-motion:reduce) { * { transition:none !important; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4h8l4 7-4 8H8l-4-8 4-7Z"/><path d="m8 9 4 7 4-7M8 9h8"/></svg></span>
+        <span>rAI / item sorter</span>
+      </div>
+      <div id="connection" class="connection"><span class="dot"></span><span id="connection-label">Connecting to sorter</span></div>
+    </header>
+
+    <section class="intro">
+      <h1>Trash &amp; recycling sorter</h1>
+      <p>A live view of your platform, with a place for every item.</p>
+    </section>
+
+    <div id="connection-error" class="connection-error" role="status" hidden>Dashboard disconnected. Reconnecting automatically…</div>
+
+    <section class="stats" aria-label="Classified item totals">
+      <article class="stat recycle">
+        <div class="label">Recycling</div><div id="recycle-count" class="number">—</div><div class="caption">items classified for recycling</div>
+        <span class="symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 3-3 4 7M3 13l-1 4 8 1m10-8 3 3-4 7M12 2 8 9m-6 8 4-7m13 10h-8"/></svg></span>
+      </article>
+      <article class="stat trash">
+        <div class="label">Trash</div><div id="trash-count" class="number">—</div><div class="caption">items classified for trash</div>
+        <span class="symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg></span>
+      </article>
+      <article class="stat total">
+        <div class="label">Total items</div><div id="total-count" class="number">—</div><div class="caption">saved across sessions</div>
+        <span class="symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg></span>
+      </article>
+    </section>
+
+    <div class="workspace">
+      <section class="panel camera-panel" aria-labelledby="camera-title">
+        <div class="panel-heading"><div><h2 id="camera-title">Platform camera</h2><p class="subtle">One item at a time. Clear the platform between items.</p></div><span id="live-label" class="live"><span class="dot"></span><span id="live-text">Waiting</span></span></div>
+        <div class="feed">
+          <img id="video" src="/video_feed" alt="Live overhead camera view of the sorting platform">
+          <div id="feed-placeholder" class="feed-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="3" y="6" width="18" height="14" rx="3"/><path d="m8 6 1-3h6l1 3"/><circle cx="12" cy="13" r="4"/></svg><span id="feed-message">Waiting for the camera feed…</span></div>
+          <span class="feed-tag">Live platform view</span>
+        </div>
+        <div class="camera-footer"><p id="camera-status">Connecting to the camera…</p><button id="recalibrate" class="small-button" type="button" title="Clear the platform before recalibrating">Recalibrate empty platform</button></div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="panel note-panel" aria-labelledby="note-title">
+          <div class="section-heading"><h2 id="note-title">Next item note</h2><span class="optional">Optional</span></div>
+          <p class="description">Add context before placing your next item. It stays with that item and is cleared for the following one.</p>
+          <form id="note-form">
+            <label for="next-note">What should the sorter know?</label>
+            <textarea id="next-note" maxlength="2000" placeholder="e.g. This container held food and still has grease inside." aria-describedby="note-help note-length"></textarea>
+            <div class="form-footer"><span id="note-help">Details help classification; recycling rules still apply.</span><span id="note-length">0 / 2000</span></div>
+            <button id="save-note" class="primary" type="submit">Save for next item</button>
+          </form>
+          <div class="queued"><div class="row"><h3>Queued for next item</h3><button id="clear-note" class="link-button" type="button" disabled>Clear</button></div><p id="queued-note" class="empty">No note queued.</p></div>
+          <p id="note-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="panel latest-panel" aria-labelledby="latest-title">
+          <div class="latest-heading"><h2 id="latest-title">Latest result</h2><span id="latest-decision" class="badge">Waiting</span></div>
+          <p id="latest-name">Ready for the first item</p>
+          <p id="latest-reason">Start with an empty platform, then place one item and let it settle.</p>
+          <p id="latest-meta"></p>
+        </section>
+      </aside>
+    </div>
+
+    <section class="panel history" aria-labelledby="history-title">
+      <div class="history-heading"><div><h2 id="history-title">Item history</h2><p class="subtle">Names and destinations from completed classifications.</p></div><div class="reset-control"><button id="reset-history" class="danger small-button" type="button">Reset counts &amp; history</button><span class="subtle">Temporary control · saved photos are kept</span></div></div>
+      <div id="history-table" class="table-scroll" hidden><table><thead><tr><th scope="col">Item</th><th scope="col">Destination</th><th scope="col">Confidence</th><th scope="col">Added</th></tr></thead><tbody id="history-body"></tbody></table></div>
+      <div id="empty-history" class="empty-history"><p>A fresh start.</p><p>Classified items will appear here with their names and destinations.</p></div>
+      <p id="history-summary" hidden></p>
+    </section>
+    <p id="action-feedback" class="feedback" role="status" aria-live="polite"></p>
+    <footer class="page-footer"><span>Totals reflect classification decisions; physical bin arrival is not yet measured.</span><span>The live video feed stays on this device.</span></footer>
+  </main>
+
+  <script>
+    'use strict';
+    const el = (id) => document.getElementById(id);
+    const number = new Intl.NumberFormat();
+    const labels = { recycle: 'Recycling', trash: 'Trash', hold: 'Hold', empty: 'Empty platform' };
+    let lastHistory = '';
+    let lastResult = '';
+    let streamRetry = null;
+    let streamReady = false;
+    let cameraOnline = false;
+    let streamFailed = false;
+    let stateRevision = 0;
+
+    function text(value, fallback = '') { return value == null ? fallback : String(value); }
+    function confidence(value) { return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value * 100)}%` : '—'; }
+    function timeLabel(value) {
+      const date = new Date(value);
+      return !value || Number.isNaN(date.getTime()) ? '—' : date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+    function setFeedback(id, message, error = false) {
+      el(id).textContent = message;
+      el(id).classList.toggle('error', error);
+    }
+    function updateFeed() {
+      if (!streamFailed && el('video').naturalWidth > 0) streamReady = true;
+      const online = cameraOnline && streamReady;
+      el('live-label').classList.toggle('online', online);
+      el('live-text').textContent = online ? 'Live' : (cameraOnline ? 'Connecting' : 'Offline');
+      el('feed-placeholder').hidden = online;
+      el('video').classList.toggle('ready', online);
+      el('feed-message').textContent = cameraOnline ? 'Connecting to the live camera feed…' : 'Waiting for the camera feed…';
+    }
+    function appendText(parent, tag, className, value) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      node.textContent = text(value);
+      parent.appendChild(node);
+      return node;
+    }
+    function renderHistory(items) {
+      const encoded = JSON.stringify(items);
+      if (encoded === lastHistory) return;
+      lastHistory = encoded;
+      el('history-body').replaceChildren();
+      el('history-table').hidden = items.length === 0;
+      el('empty-history').hidden = items.length > 0;
+      el('history-summary').hidden = items.length <= 100;
+      if (items.length > 100) el('history-summary').textContent = `Showing the latest 100 of ${number.format(items.length)} saved items.`;
+      const fragment = document.createDocumentFragment();
+      items.slice(0, 100).forEach((item) => {
+        const row = document.createElement('tr');
+        const nameCell = document.createElement('td');
+        appendText(nameCell, 'p', 'item-name', item.item || 'Unnamed item');
+        const details = [item.material, item.reason].filter(Boolean).join(' · ');
+        if (details) appendText(nameCell, 'p', 'item-detail', details);
+        if (item.additional_info) appendText(nameCell, 'p', 'item-detail', `Your note: ${item.additional_info}`);
+        row.appendChild(nameCell);
+        const decisionCell = document.createElement('td');
+        appendText(decisionCell, 'span', `badge ${item.decision === 'recycle' ? 'recycle' : 'trash'}`, labels[item.decision] || item.decision);
+        row.appendChild(decisionCell);
+        appendText(row, 'td', 'confidence', confidence(item.confidence));
+        const timeCell = appendText(row, 'td', 'time', timeLabel(item.captured_at));
+        timeCell.title = text(item.captured_at);
+        fragment.appendChild(row);
+      });
+      el('history-body').appendChild(fragment);
+    }
+    function renderLatest(result) {
+      const encoded = JSON.stringify(result);
+      if (encoded === lastResult) return;
+      lastResult = encoded;
+      const decision = result ? result.decision : '';
+      el('latest-decision').className = `badge ${['recycle', 'trash', 'hold'].includes(decision) ? decision : ''}`;
+      el('latest-decision').textContent = result && result.dry_run ? 'Dry run' : (labels[decision] || 'Waiting');
+      el('latest-name').textContent = result ? text(result.item, 'Unknown item') : 'Ready for the first item';
+      el('latest-reason').textContent = result ? text(result.reason) : 'Start with an empty platform, then place one item and let it settle.';
+      el('latest-meta').textContent = result ? [result.material, `${confidence(result.confidence)} confidence`, timeLabel(result.captured_at)].filter(Boolean).join(' · ') : '';
+    }
+    function render(state) {
+      const counts = state.counts || {};
+      ['recycle', 'trash', 'total'].forEach((key) => { el(`${key}-count`).textContent = number.format(counts[key] || 0); });
+      const note = text(state.pending_note);
+      el('queued-note').textContent = note || 'No note queued.';
+      el('queued-note').classList.toggle('empty', !note);
+      el('clear-note').disabled = !note;
+      el('camera-status').textContent = text(state.status, 'Waiting for the camera…');
+      cameraOnline = Boolean(state.camera_online);
+      updateFeed();
+      renderHistory(Array.isArray(state.items) ? state.items : []);
+      renderLatest(state.latest_result || null);
+    }
+    async function readResponse(response) {
+      let body;
+      try { body = await response.json(); } catch (_) { throw new Error('The dashboard returned an unreadable response.'); }
+      if (!response.ok) throw new Error(text(body.error, 'The request could not be completed.'));
+      return body;
+    }
+    async function post(path, data) {
+      stateRevision += 1;
+      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data), cache: 'no-store' });
+      const state = await readResponse(response);
+      stateRevision += 1;
+      render(state);
+      return state;
+    }
+    async function poll() {
+      const revision = stateRevision;
+      try {
+        const state = await readResponse(await fetch('/api/state', { cache: 'no-store' }));
+        if (revision === stateRevision) render(state);
+        el('connection').classList.add('connected');
+        el('connection-label').textContent = 'Connected · localhost';
+        el('connection-error').hidden = true;
+      } catch (_) {
+        el('connection').classList.remove('connected');
+        el('connection-label').textContent = 'Reconnecting';
+        el('connection-error').hidden = false;
+        cameraOnline = false;
+        updateFeed();
+      } finally { window.setTimeout(poll, 1000); }
+    }
+    el('next-note').addEventListener('input', () => { el('note-length').textContent = `${el('next-note').value.length} / 2000`; });
+    el('note-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const submitted = el('next-note').value;
+      el('save-note').disabled = true;
+      try {
+        await post('/api/next-item', { note: submitted.trim() });
+        if (el('next-note').value === submitted) { el('next-note').value = ''; el('note-length').textContent = '0 / 2000'; }
+        setFeedback('note-feedback', submitted.trim() ? 'Saved for the next item.' : 'Queued note cleared.');
+      } catch (error) { setFeedback('note-feedback', error.message, true); }
+      finally { el('save-note').disabled = false; }
+    });
+    el('clear-note').addEventListener('click', async () => {
+      el('clear-note').disabled = true;
+      try { await post('/api/next-item', { note: '' }); setFeedback('note-feedback', 'Queued note cleared.'); }
+      catch (error) { el('clear-note').disabled = false; setFeedback('note-feedback', error.message, true); }
+    });
+    el('reset-history').addEventListener('click', async () => {
+      el('reset-history').disabled = true;
+      try { await post('/api/reset', {}); setFeedback('action-feedback', 'Counts and item history reset. Saved photos and the queued note were kept.'); }
+      catch (error) { setFeedback('action-feedback', error.message, true); }
+      finally { el('reset-history').disabled = false; }
+    });
+    el('recalibrate').addEventListener('click', async () => {
+      el('recalibrate').disabled = true;
+      try { await post('/api/recalibrate', {}); setFeedback('action-feedback', 'Recalibration requested. Keep the platform empty.'); }
+      catch (error) { setFeedback('action-feedback', error.message, true); }
+      finally { el('recalibrate').disabled = false; }
+    });
+    el('video').addEventListener('load', () => { streamFailed = false; streamReady = true; updateFeed(); });
+    el('video').addEventListener('error', () => {
+      streamFailed = true;
+      streamReady = false;
+      updateFeed();
+      window.clearTimeout(streamRetry);
+      streamRetry = window.setTimeout(() => { streamFailed = false; el('video').src = `/video_feed?reconnect=${Date.now()}`; }, 2500);
+    });
+    if (el('video').naturalWidth > 0) streamReady = true;
+    poll();
+  </script>
+</body>
+</html>

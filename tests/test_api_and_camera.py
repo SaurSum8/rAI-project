@@ -16,6 +16,8 @@ import numpy as np
 from openai import OpenAI
 from pydantic import ValidationError
 
+from dashboard import DashboardState
+
 from camera_sorter import (
     Classification,
     ChangeDetector,
@@ -37,7 +39,7 @@ class ClassificationContractTests(unittest.TestCase):
         }
         self.requests = []
 
-    def classify(self, *, status="completed", refusal=False, model=DEFAULT_MODEL):
+    def classify(self, *, status="completed", refusal=False, model=DEFAULT_MODEL, additional_info=""):
         content = (
             {"type": "refusal", "refusal": "Cannot classify this image."}
             if refusal
@@ -70,7 +72,7 @@ class ClassificationContractTests(unittest.TestCase):
             max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(respond)),
         ) as client:
-            return classify_image(client, b"test-jpeg", model, "our acceptance policy", 0.75)
+            return classify_image(client, b"test-jpeg", model, "our acceptance policy", 0.75, additional_info)
 
     def test_real_sdk_sends_image_and_strict_schema_and_parses_result(self):
         result = self.classify()
@@ -116,6 +118,14 @@ class ClassificationContractTests(unittest.TestCase):
     def test_alternative_model_does_not_receive_default_model_reasoning_option(self):
         self.classify(model="another-vision-model")
         self.assertNotIn("reasoning", self.requests[0])
+
+    def test_additional_item_information_is_sent_as_user_context(self):
+        note = "The bottle previously contained cooking oil."
+        self.classify(additional_info=note)
+        request = self.requests[0]
+        self.assertNotIn(note, request["instructions"])
+        text_content = [part["text"] for part in request["input"][0]["content"] if part["type"] == "input_text"]
+        self.assertTrue(any(note in text for text in text_content))
 
 
 class CameraIntegrationTests(unittest.TestCase):
@@ -224,7 +234,7 @@ class CameraIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
                     patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
-                    patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 1.3, 1.4, 2.5, 4.3, 4.4]), \
+                    patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 1.3, 1.4, 2.5, 6.3, 6.4]), \
                     patch("camera_sorter.time.sleep"), \
                     contextlib.redirect_stdout(output):
                 with self.assertRaises(RuntimeError):
@@ -256,6 +266,63 @@ class CameraIntegrationTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["decision"], "hold")
         executor.submit.assert_called_once()
+
+    def test_item_retry_keeps_note_and_identity_until_empty_platform_starts_next_item(self):
+        camera = Mock()
+        camera.isOpened.return_value = True
+        frames = [self.empty, self.item, self.item, self.replacement,
+                  self.item, self.item, self.item, self.item,
+                  self.empty, self.empty, self.item, self.item, self.item]
+        camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
+        clock = [0, 0, 0.1, 1.2, 1.3, 1.4, 2.5, 6.3, 6.4, 7, 8.1, 9, 11.4, 11.5]
+        output = io.StringIO()
+        submitted_notes = []
+        with tempfile.TemporaryDirectory() as directory:
+            state = DashboardState(Path(directory) / "history.sqlite3")
+            state.set_next_note("First item: clean aluminum can.")
+
+            def complete_request(*args):
+                submitted_notes.append(args[-1])
+                if len(submitted_notes) == 1:
+                    state.set_next_note("Second item: wax-lined cup.")
+                future = Future()
+                future.set_result(Classification(
+                    decision="trash" if len(submitted_notes) == 3 else "recycle",
+                    item="cup" if len(submitted_notes) == 3 else "can",
+                    material="paper" if len(submitted_notes) == 3 else "metal",
+                    confidence=0.95,
+                    reason="Classified with the item's note.",
+                ))
+                return future
+
+            executor = Mock()
+            executor.submit.side_effect = complete_request
+            try:
+                with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
+                        patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
+                        patch("camera_sorter.time.monotonic", side_effect=clock), \
+                        patch("camera_sorter.time.sleep"), \
+                        patch.object(state, "publish_frame"), \
+                        patch.object(state, "claim_next_item", wraps=state.claim_next_item) as claim, \
+                        contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(RuntimeError, "stopped returning frames"):
+                        run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy", state)
+                self.assertEqual(claim.call_count, 2)
+                self.assertEqual(submitted_notes, [
+                    "First item: clean aluminum can.",
+                    "First item: clean aluminum can.",
+                    "Second item: wax-lined cup.",
+                ])
+                records = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual([record["decision"] for record in records], ["hold", "recycle", "trash"])
+                self.assertEqual(records[0]["item_id"], records[1]["item_id"])
+                self.assertNotEqual(records[1]["item_id"], records[2]["item_id"])
+                self.assertEqual([record["additional_info"] for record in records], submitted_notes)
+                snapshot = state.get_snapshot()
+                self.assertEqual(snapshot["counts"], {"trash": 1, "recycle": 1, "total": 2})
+                self.assertEqual(snapshot["pending_note"], "")
+            finally:
+                state.close()
 
 
 if __name__ == "__main__":
