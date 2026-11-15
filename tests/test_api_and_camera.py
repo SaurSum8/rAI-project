@@ -197,12 +197,12 @@ class CameraIntegrationTests(unittest.TestCase):
 
     def test_dry_run_saves_once_per_item_and_releases_disconnected_camera(self):
         frames = [self.empty, self.item, self.item, self.item,
-                  self.empty, self.empty, self.item, self.item]
+                  self.empty, self.empty, self.empty, self.item, self.item]
         camera = Mock()
         camera.isOpened.return_value = True
         camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
         # First value establishes the warmup deadline; remaining values timestamp frames.
-        clock = [0, 0, 0.1, 1.2, 5, 6, 7.1, 8, 9.1]
+        clock = [0, 0, 0.1, 1.2, 5, 6, 7.1, 8.2, 9, 10.1]
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
@@ -225,14 +225,17 @@ class CameraIntegrationTests(unittest.TestCase):
                 self.assertEqual(json.loads(image_path.with_suffix(".json").read_text()), record)
         camera.release.assert_called_once()
 
-    def test_async_result_routes_only_when_current_scene_remains_stable(self):
+    def test_async_results_ignore_motion_only_while_cooldown_is_active(self):
         custom = BinConfig(
             bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
                   BinDefinition("B", "Reuse", ("Working components.",))),
             fallback_bin="B", hold_rules=(),
         )
-        for scene_changed in (False, True):
-            with self.subTest(scene_changed=scene_changed), tempfile.TemporaryDirectory() as directory:
+        cases = [(5, False, 1.3, "A"), (5, True, 1.3, "A"), (0, True, 1.3, "hold"),
+                 (5, False, 6.2, "A"), (5, True, 6.2, "hold")]
+        for cooldown, scene_changed, completion_time, expected in cases:
+            with self.subTest(cooldown=cooldown, scene_changed=scene_changed, completion_time=completion_time), \
+                    tempfile.TemporaryDirectory() as directory:
                 last_frame = self.replacement if scene_changed else self.item
                 camera = Mock()
                 camera.isOpened.return_value = True
@@ -247,39 +250,89 @@ class CameraIntegrationTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
                         patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
-                        patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 1.3]), \
+                        patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, completion_time]), \
                         patch("camera_sorter.time.sleep"), \
                         contextlib.redirect_stdout(output):
                     with self.assertRaises(RuntimeError):
-                        run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy",
+                        run_camera(self.args(directory, dry_run=False), ChangeDetector(cooldown_seconds=cooldown), Mock(), "policy",
                                    bin_config=custom)
                 records = [json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]["decision"], "hold" if scene_changed else "A")
-                if not scene_changed:
+                self.assertEqual(records[0]["decision"], expected)
+                if expected == "A":
                     self.assertEqual(records[0]["bin_name"], "Repair")
                 executor.submit.assert_called_once()
                 camera.release.assert_called_once()
 
-    def test_stale_result_retries_after_same_view_settles_and_cooldown_expires(self):
+    def test_changes_during_cooldown_do_not_queue_a_photo_or_api_call_at_expiry(self):
+        frames = [self.empty, self.item, self.item, self.empty, self.replacement,
+                  self.replacement, self.replacement, self.replacement]
+        clock = [0, 0, 0.1, 1.2, 2, 3, 6.2, 7.3, 20]
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            state = DashboardState(Path(directory) / "history.sqlite3")
+            state.set_next_note("Information for the first item.")
+            frame_iterator = iter(enumerate(frames))
+
+            def read_frame():
+                try:
+                    index, frame = next(frame_iterator)
+                except StopIteration:
+                    return False, None
+                if index == 3:
+                    state.set_next_note("Information waiting for the next item.")
+                return True, frame
+
+            camera = Mock()
+            camera.isOpened.return_value = True
+            camera.read.side_effect = read_frame
+            completed = Future()
+            completed.set_result(Classification(
+                decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
+            ))
+            executor = Mock()
+            executor.submit.return_value = completed
+            try:
+                with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
+                        patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
+                        patch("camera_sorter.time.monotonic", side_effect=clock), \
+                        patch("camera_sorter.time.sleep"), \
+                        patch.object(state, "publish_frame"), \
+                        patch.object(state, "claim_next_item", wraps=state.claim_next_item) as claim, \
+                        contextlib.redirect_stdout(output):
+                    with self.assertRaisesRegex(RuntimeError, "stopped returning frames"):
+                        run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy", state)
+                executor.submit.assert_called_once()
+                self.assertEqual(claim.call_count, 1)
+                self.assertEqual(len(list(Path(directory).glob("*.jpg"))), 1)
+                records = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["decision"], "A")
+                self.assertEqual(state.get_snapshot()["pending_note"], "Information waiting for the next item.")
+            finally:
+                state.close()
+
+    def test_stale_result_after_cooldown_retries_only_after_fresh_motion_settles(self):
         camera = Mock()
         camera.isOpened.return_value = True
-        frames = [self.empty, self.item, self.item, self.replacement,
-                  self.item, self.item, self.item, self.item]
+        frames = [self.empty, self.item, self.item, self.item, self.item,
+                  self.item, self.replacement, self.replacement, self.replacement]
         camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
         result = Classification(
             decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
         )
-        completions = [Future(), Future()]
-        for future in completions:
-            future.set_result(result)
+        delayed = Mock()
+        delayed.done.side_effect = [False, False, False, True]
+        delayed.result.return_value = result
+        completed = Future()
+        completed.set_result(result)
         executor = Mock()
-        executor.submit.side_effect = completions
+        executor.submit.side_effect = [delayed, completed]
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
                     patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
-                    patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 1.3, 1.4, 2.5, 6.3, 6.4]), \
+                    patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 2, 6.2, 7.3, 7.4, 8.5, 8.6]), \
                     patch("camera_sorter.time.sleep"), \
                     contextlib.redirect_stdout(output):
                 with self.assertRaises(RuntimeError):
@@ -315,11 +368,13 @@ class CameraIntegrationTests(unittest.TestCase):
     def test_item_retry_keeps_note_and_identity_until_empty_platform_starts_next_item(self):
         camera = Mock()
         camera.isOpened.return_value = True
-        frames = [self.empty, self.item, self.item, self.replacement,
-                  self.item, self.item, self.item, self.item,
-                  self.empty, self.empty, self.item, self.item, self.item]
+        frames = [self.empty, self.item, self.item, self.empty, self.empty,
+                  self.item, self.item, self.replacement, self.replacement, self.replacement,
+                  self.empty, self.empty, self.empty, self.empty,
+                  self.item, self.item, self.item]
         camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
-        clock = [0, 0, 0.1, 1.2, 1.3, 1.4, 2.5, 6.3, 6.4, 7, 8.1, 9, 11.4, 11.5]
+        clock = [0, 0, 0.1, 1.2, 2, 3.1, 6.2, 7.3, 7.4, 8.5, 8.6,
+                 9, 10.1, 13.5, 14.6, 15, 16.1, 16.2]
         output = io.StringIO()
         submitted_notes = []
         with tempfile.TemporaryDirectory() as directory:
@@ -331,14 +386,20 @@ class CameraIntegrationTests(unittest.TestCase):
                 submitted_notes.append(additional_info)
                 if len(submitted_notes) == 1:
                     state.set_next_note("Second item: wax-lined cup.")
-                future = Future()
-                future.set_result(Classification(
+                classification = Classification(
                     decision="B" if len(submitted_notes) == 3 else "A",
                     item="cup" if len(submitted_notes) == 3 else "can",
                     material="paper" if len(submitted_notes) == 3 else "metal",
                     confidence=0.95,
                     reason="Classified with the item's note.",
-                ))
+                )
+                if len(submitted_notes) == 1:
+                    future = Mock()
+                    future.done.side_effect = [False, False, False, False, True]
+                    future.result.return_value = classification
+                else:
+                    future = Future()
+                    future.set_result(classification)
                 return future
 
             executor = Mock()

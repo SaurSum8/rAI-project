@@ -47,6 +47,7 @@ class SceneState:
     foreground_fraction: float
     motion_fraction: float
     stable: bool
+    waiting_for_change: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,10 @@ class ChangeDetector:
         self._stable_since: Optional[float] = None
         self._submitted: Optional[np.ndarray] = None
         self._last_submission = -math.inf
+        self._cooldown_active = False
+        self._cooldown_foreground = 0.0
+        self._waiting_for_change = False
+        self._resume_reference: Optional[np.ndarray] = None
 
     @staticmethod
     def _prepare(frame: np.ndarray) -> np.ndarray:
@@ -107,14 +112,21 @@ class ChangeDetector:
         self._stable_reference = None
         self._stable_since = None
         self._submitted = None
+        if not self._cooldown_active:
+            self._waiting_for_change = False
+            self._resume_reference = None
 
     def mark_submitted(self, frame: np.ndarray, now: float) -> None:
         # Mark attempts as well as successes, so API errors cannot cause a request loop.
         self._submitted = self._prepare(frame)
         self._last_submission = now
+        self._cooldown_active = self.cooldown_seconds > 0
+        self._cooldown_foreground = self._difference(self._submitted, self._baseline)
+        self._waiting_for_change = False
+        self._resume_reference = None
 
     def rearm(self) -> None:
-        """Allow a fresh capture after settling, while preserving the cooldown."""
+        """Allow another attempt without bypassing cooldown or fresh-change gates."""
         self._submitted = None
 
     def cooldown_remaining(self, now: float) -> float:
@@ -126,9 +138,32 @@ class ChangeDetector:
     def update(self, frame: np.ndarray, now: float) -> SceneState:
         if self._baseline is None:
             raise RuntimeError("Calibrate with the empty platform before detection.")
+        if self._cooldown_active and self.cooldown_remaining(now) > 0:
+            # Treat the captured scene as stable. Movement, empty-platform resets,
+            # and settling observed during cooldown must not queue another photo.
+            return SceneState(False, self._cooldown_foreground, 0.0, True)
         current = self._prepare(frame)
         foreground = self._difference(current, self._baseline)
+        if self._cooldown_active:
+            # Sample a new reference when monitoring resumes. A scene that changed
+            # during cooldown is not itself a new post-cooldown event.
+            self._cooldown_active = False
+            self._waiting_for_change = True
+            self._resume_reference = current.copy()
+            self._previous = current
+            self._stable_reference = current.copy()
+            self._stable_since = now
+            return SceneState(False, foreground, 0.0, False, True)
         motion = self._difference(current, self._previous)
+        if self._waiting_for_change:
+            resumed_change = self._difference(current, self._resume_reference)
+            if (max(motion, resumed_change) > self.motion_fraction
+                    or resumed_change >= self.change_fraction):
+                self._waiting_for_change = False
+                self._resume_reference = None
+                self._submitted = None
+                self._stable_reference = current.copy()
+                self._stable_since = now
         drift = (self._difference(current, self._stable_reference)
                  if self._stable_reference is not None else 0)
         # The stable reference catches slow cumulative movement between frames.
@@ -139,10 +174,11 @@ class ChangeDetector:
         if stable and foreground < self.reset_fraction:
             self.rearm()
         distinct = self._submitted is None or self._difference(current, self._submitted) >= self.change_fraction
-        ready = (stable and foreground >= self.change_fraction and distinct
+        ready = (not self._waiting_for_change and stable
+                 and foreground >= self.change_fraction and distinct
                  and self.cooldown_remaining(now) == 0)
         self._previous = current
-        return SceneState(ready, foreground, motion, stable)
+        return SceneState(ready, foreground, motion, stable, self._waiting_for_change)
 
 
 def build_prompt(bin_config: BinConfig) -> str:
@@ -310,7 +346,13 @@ def run_camera(args: argparse.Namespace, detector: ChangeDetector,
                     # One failed attempt produces one hold; do not endlessly resend it.
                     LOG.error("Classification failed: %s", type(exc).__name__)
                     result = hold_result(f"Classification failed ({type(exc).__name__}); inspect connection/key, then move the item to retry.")
-                if generation != submission_generation or not state.stable or not detector.matches(frame, submitted_frame):
+                # Cooldown trusts the captured view. The fresh reference's initial
+                # settling timer alone also does not make an unchanged image stale.
+                scene_unstable = not state.stable and not state.waiting_for_change
+                scene_changed = detector.cooldown_remaining(now) == 0 and (
+                    scene_unstable or not detector.matches(frame, submitted_frame)
+                )
+                if generation != submission_generation or scene_changed:
                     result = hold_result("The scene changed during classification; wait for a fresh stable capture.")
                     detector.rearm()
                 emit_result(result, metadata, args.model, args.dry_run, dashboard,
@@ -345,6 +387,8 @@ def run_camera(args: argparse.Namespace, detector: ChangeDetector,
                     status = "Classifying the captured item..."
                 elif remaining > 0:
                     status = f"Cooldown: {remaining:.1f}s remaining. {message}"
+                elif state.waiting_for_change:
+                    status = "Ready: waiting for new motion or change after cooldown"
                 elif state.foreground_fraction < detector.reset_fraction:
                     status = "Ready: place one item on the empty platform"
                 elif not state.stable:

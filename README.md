@@ -60,15 +60,19 @@ python camera_sorter.py
 
 Open **http://localhost:8000** for the live camera feed and controls. Choose a different port with `--port 8080`. The server listens on this computer only. The feed uses the same platform crop as the detector and continues streaming during classification and cooldown.
 
-Allow the two-second camera warmup to finish with the platform empty, then place one item on it. The detector waits for one second of stability before capturing. Keep hands clear of the platform while it settles. An unchanged item is submitted once; removing it to reveal a stable empty platform rearms detection. A substantial change to the item can also trigger a new capture after the cooldown.
+Allow the two-second camera warmup to finish with the platform empty, then place one item on it. The detector waits for one second of stability before capturing. Keep hands clear of the platform while it settles. An unchanged item is submitted once. Outside cooldown, a stable empty platform rearms detection, and a substantial new change can trigger another capture after settling.
 
-After each capture, no new photos are taken for **5 seconds** by default. Set the interval with `--cooldown-seconds`, including `0` to disable the cooldown:
+After each capture, the detector ignores all scene changes and motion for **5 seconds** by default, treating the scene as stable during that interval. Movement during cooldown does not queue a capture or retry and does not count toward settling. The live feed continues streaming.
+
+When cooldown expires, the first frame establishes a fresh reference. A new change or motion after that frame, followed by the normal settling interval, is required for another capture. For example, an item placed entirely during cooldown and left still will not trigger a photo until it is moved after cooldown.
+
+Set the interval with `--cooldown-seconds`, including `0` to disable this ignore period:
 
 ```sh
 python camera_sorter.py --cooldown-seconds 0
 ```
 
-Change detection and stability checks still apply with no cooldown. Clearing or recalibrating the platform does not shorten an active cooldown.
+With no cooldown, normal change detection, stability checks, and duplicate filtering apply continuously. Clearing or recalibrating the platform does not shorten an active cooldown or queue a capture.
 
 Stop with Ctrl+C in the terminal. The dashboard has a recalibration button; use it with an empty platform. To also show the original OpenCV desktop window, add `--desktop-preview`; that window supports **q**/**Esc** to quit and **r** to recalibrate. `--no-preview` disables the desktop window while keeping the browser feed. `--no-web` disables the dashboard. Your operating system may ask for camera permission for the terminal or IDE running Python.
 
@@ -88,9 +92,9 @@ Add `--dry-run` to test the one-photo path without an API call.
 
 ## Next-item information and history
 
-Before placing an item, type any extra information into the dashboard's note box and save it. The queued note is optional, can be replaced or cleared, and is consumed when the next item is captured. The API receives it alongside the image as context for that item; it cannot override the configured bin rules. If classification retries, the note stays with that same item. Information entered after an item has been captured is reserved for the following item.
+Before placing an item, type any extra information into the dashboard's note box and save it. The queued note is optional, can be replaced or cleared, and is consumed when the next item is captured. The API receives it alongside the image as context for that item; it cannot override the configured bin rules. If a later capture retries classification of the same item, the note stays with it. Such retries require a fresh change after cooldown and the normal settling interval; movement during cooldown does not queue them. Information entered after an item has been captured is reserved for the following item.
 
-Clear the platform between items and allow it to appear empty for the settling interval (one second by default). This separates item identities: multiple captures of the same item update one history entry rather than increasing the count. Replacing an item without a stable empty interval is treated as another view of the current item.
+Clear the platform between items and allow it to appear empty for the settling interval (one second by default) after cooldown has expired. Empty-platform observations during cooldown are ignored. This separates item identities: multiple captures of the same item update one history entry rather than increasing the count. Replacing an item without an observed stable empty interval is treated as another view of the current item.
 
 The dashboard displays **Bin A / its configured name**, **Bin B / its configured name**, their rule lists, and combined totals, plus item names supplied by the model, materials, timestamps, and explanations. Only completed `A` or `B` classifications enter the history; `hold`, `empty`, and dry-run results do not increase totals. These are classification destinations until a physical pusher or bin sensor confirms delivery.
 
@@ -109,7 +113,7 @@ Run `python camera_sorter.py --help` for all options.
 | `--motion-fraction` | `0.01` | Changed-pixel fraction tolerated while the scene settles. |
 | `--reset-fraction` | `0.01` | Difference from the empty baseline allowed when rearming. |
 | `--settle-seconds` | `1` | Required stable time before capture. |
-| `--cooldown-seconds` | `5` | Seconds between captures; `0` disables the cooldown. |
+| `--cooldown-seconds` | `5` | Seconds after capture during which scene changes are ignored; afterward, a fresh change and settling are required. `0` disables this period. |
 | `--warmup-seconds` | `2` | Camera warmup before establishing the empty baseline. |
 | `--min-confidence` | `0.75` | Minimum confidence for the nonfallback bin; lower-confidence decisions go to `fallback_bin`. |
 | `--bins-config` | `bins.json` | Names, rules, fallback bin, and hold rules, loaded at startup. |
@@ -123,7 +127,7 @@ Use steady lighting. Camera movement, shadows, and exposure changes can look lik
 
 Each completed capture produces one JSON line on standard output and saves a JPEG plus a result JSON file under `captures/`. Records include `item_id` and `additional_info` so retries can be associated with the same item, plus `bin_name` for the destination name at classification time. Diagnostic logs go to standard error. `.venv/`, `.env`, `captures/`, and `data/` are ignored by Git.
 
-Decisions are `A`, `B`, `hold`, or `empty`, with an item description, material, confidence, reason, and capture metadata. A future actuator should move an item only for `A` or `B`; `hold` means leave it in place and `empty` means no item to move. Ambiguous sorting decisions use the configured fallback bin. Operational problems such as hands or another obstruction, multiple items, an unusable view, uncertain item presence, or API failures produce `hold`, as do cases listed in `hold_rules`. The default configuration holds hazardous items. If the scene changes while a request is in flight, the earlier classification is held instead of being used to move the current item.
+Decisions are `A`, `B`, `hold`, or `empty`, with an item description, material, confidence, reason, and capture metadata. A future actuator should move an item only for `A` or `B`; `hold` means leave it in place and `empty` means no item to move. Ambiguous sorting decisions use the configured fallback bin. Operational problems such as hands or another obstruction, multiple items, an unusable view, uncertain item presence, or API failures produce `hold`, as do cases listed in `hold_rules`. The default configuration holds hazardous items. Scene validation is paused during cooldown, so ignored motion does not invalidate the captured image's classification. Outside cooldown, a response for an image that no longer matches the current scene produces `hold`. Recalibration also invalidates an outstanding classification. Any retry still requires a fresh change after cooldown followed by settling.
 
 Only triggered photos are sent to the API; the camera video stays local. Captured photos remain on disk until you remove them.
 

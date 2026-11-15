@@ -20,14 +20,15 @@ class ChangeDetectorTests(unittest.TestCase):
             reset_fraction=0.01,
             pixel_threshold=25,
             settle_seconds=1.0,
-            cooldown_seconds=3.0,
         )
         self.detector.calibrate(self.empty)
 
     def settle_first_item(self):
         self.assertFalse(self.detector.update(self.item, now=0.0).ready)
-        self.assertTrue(self.detector.update(self.item, now=1.1).ready)
+        settled = self.detector.update(self.item, now=1.1)
+        self.assertTrue(settled.ready)
         self.detector.mark_submitted(self.item, now=1.1)
+        return settled
 
     def test_unchanged_platform_and_low_amplitude_noise_do_not_trigger(self):
         noise = np.random.default_rng(42).integers(
@@ -76,26 +77,80 @@ class ChangeDetectorTests(unittest.TestCase):
     def test_stable_empty_platform_rearms_an_identical_item(self):
         self.settle_first_item()
         self.assertFalse(self.detector.update(self.empty, now=5.0).ready)
-        empty_state = self.detector.update(self.empty, now=6.1)
+        self.assertFalse(self.detector.update(self.empty, now=6.2).ready)
+        empty_state = self.detector.update(self.empty, now=7.3)
         self.assertTrue(empty_state.stable)
         self.assertFalse(empty_state.ready)
 
-        self.assertFalse(self.detector.update(self.item, now=7.0).ready)
-        self.assertTrue(self.detector.update(self.item, now=8.1).ready)
+        self.assertFalse(self.detector.update(self.item, now=8.0).ready)
+        self.assertTrue(self.detector.update(self.item, now=9.1).ready)
 
-    def test_changed_item_waits_for_cooldown(self):
+    def test_cooldown_ignores_changes_without_queuing_a_later_capture(self):
+        captured = self.settle_first_item()
+        self.assertEqual(self.detector.cooldown_seconds, 5)
+        for frame, now in [(self.empty, 1.2), (self.replacement, 3.0), (self.empty, 6.0)]:
+            with self.subTest(now=now):
+                ignored = self.detector.update(frame, now=now)
+                self.assertFalse(ignored.ready)
+                self.assertTrue(ignored.stable)
+                self.assertEqual(ignored.motion_fraction, 0)
+                self.assertEqual(ignored.foreground_fraction, captured.foreground_fraction)
+        for now in [6.1, 7.2, 100]:
+            with self.subTest(after_expiry=now):
+                waiting = self.detector.update(self.replacement, now=now)
+                self.assertFalse(waiting.ready)
+                self.assertTrue(waiting.waiting_for_change)
+
+    def test_post_expiry_motion_can_return_to_the_last_captured_view(self):
         self.settle_first_item()
-        self.assertFalse(self.detector.update(self.replacement, now=1.2).ready)
-        settled = self.detector.update(self.replacement, now=2.3)
-        self.assertTrue(settled.stable)
-        self.assertFalse(settled.ready)
-        self.assertTrue(self.detector.update(self.replacement, now=4.2).ready)
+        self.detector.update(self.replacement, now=2.0)
+        self.assertFalse(self.detector.update(self.replacement, now=6.1).ready)
+        self.assertFalse(self.detector.update(self.replacement, now=7.2).ready)
+        self.assertFalse(self.detector.update(self.item, now=8.0).ready)
+        self.assertTrue(self.detector.update(self.item, now=9.1).ready)
 
-    def test_explicit_rearm_preserves_cooldown_for_the_same_scene(self):
+    def test_explicit_rearm_cannot_skip_cooldown_or_the_fresh_change_requirement(self):
         self.settle_first_item()
         self.detector.rearm()
         self.assertFalse(self.detector.update(self.item, now=2.3).ready)
-        self.assertTrue(self.detector.update(self.item, now=4.2).ready)
+        self.assertFalse(self.detector.update(self.item, now=6.1).ready)
+        self.detector.rearm()
+        self.assertFalse(self.detector.update(self.item, now=8.0).ready)
+        self.assertFalse(self.detector.update(self.replacement, now=9.0).ready)
+        self.assertTrue(self.detector.update(self.replacement, now=10.1).ready)
+
+    def test_recalibration_preserves_active_cooldown_and_fresh_monitoring_anchor(self):
+        self.settle_first_item()
+        self.detector.calibrate(self.empty)
+        ignored = self.detector.update(self.empty, now=2.3)
+        self.assertFalse(ignored.ready)
+        self.assertEqual(ignored.motion_fraction, 0)
+        self.assertFalse(self.detector.update(self.replacement, now=6.1).ready)
+        self.assertFalse(self.detector.update(self.replacement, now=8.0).ready)
+        self.assertFalse(self.detector.update(self.item, now=9.0).ready)
+        self.assertTrue(self.detector.update(self.item, now=10.1).ready)
+
+    def test_zero_cooldown_keeps_continuous_detection_without_an_expiry_gate(self):
+        detector = ChangeDetector(cooldown_seconds=0)
+        detector.calibrate(self.empty)
+        detector.update(self.item, now=0.0)
+        self.assertTrue(detector.update(self.item, now=1.1).ready)
+        detector.mark_submitted(self.item, now=1.1)
+        self.assertFalse(detector.update(self.replacement, now=1.2).ready)
+        self.assertTrue(detector.update(self.replacement, now=2.3).ready)
+        detector.mark_submitted(self.replacement, now=2.3)
+        detector.update(self.empty, now=2.4)
+        self.assertFalse(detector.update(self.empty, now=3.5).ready)
+        detector.update(self.item, now=3.6)
+        self.assertTrue(detector.update(self.item, now=4.7).ready)
+
+    def test_cumulative_slow_motion_is_detected_after_cooldown_expiry(self):
+        self.settle_first_item()
+        self.assertFalse(self.detector.update(self.item, now=6.1).ready)
+        for offset in range(1, 13):
+            shifted = np.roll(self.item, offset, axis=1)
+            self.assertFalse(self.detector.update(shifted, now=6.1 + 0.2 * offset).ready)
+        self.assertTrue(self.detector.update(shifted, now=9.6).ready)
 
     def test_tiny_object_does_not_cross_substantial_change_threshold(self):
         tiny = self.empty.copy()
