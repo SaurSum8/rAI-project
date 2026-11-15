@@ -49,7 +49,7 @@ class DashboardState:
             database.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    item_id TEXT NOT NULL UNIQUE,
+                    capture_id TEXT NOT NULL UNIQUE,
                     record TEXT NOT NULL
                 )
             """)
@@ -61,22 +61,57 @@ class DashboardState:
             """)
             database.execute("INSERT OR IGNORE INTO metadata VALUES ('epoch', 0)")
             self._epoch = database.execute("SELECT value FROM metadata WHERE name = 'epoch'").fetchone()[0]
+            columns = {row[1] for row in database.execute("PRAGMA table_info(history)")}
+            if "capture_id" not in columns:
+                self._migrate_capture_history(database)
             # Older versions stored destinations as recycle/trash. Preserve their
             # historical meaning even if the current configuration has new names.
-            legacy_bins = {"recycle": ("A", "Recycling"), "trash": ("B", "Trash")}
             for sequence, encoded in database.execute("SELECT sequence, record FROM history").fetchall():
                 record = json.loads(encoded)
-                legacy = legacy_bins.get(record.get("decision"))
-                if legacy is not None:
-                    record["decision"] = legacy[0]
-                    if not record.get("bin_name"):
-                        record["bin_name"] = legacy[1]
-                    if "bin_id" in record:
-                        record["bin_id"] = legacy[0]
+                if self._normalize_legacy_bin(record):
                     database.execute(
                         "UPDATE history SET record = ? WHERE sequence = ?",
                         (json.dumps(record, ensure_ascii=False, allow_nan=False), sequence),
                     )
+
+    @staticmethod
+    def _normalize_legacy_bin(record: dict) -> bool:
+        legacy = {"recycle": ("A", "Recycling"), "trash": ("B", "Trash")}.get(record.get("decision"))
+        if legacy is None:
+            return False
+        record["decision"] = legacy[0]
+        if not record.get("bin_name"):
+            record["bin_name"] = legacy[1]
+        if "bin_id" in record:
+            record["bin_id"] = legacy[0]
+        return True
+
+    @staticmethod
+    def _migrate_capture_history(database: sqlite3.Connection) -> None:
+        """Keep saved loads, deduplicating only identical known capture IDs."""
+        if not database.in_transaction:
+            database.execute("BEGIN IMMEDIATE")
+        database.execute("""
+            CREATE TABLE history_per_capture (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                capture_id TEXT NOT NULL UNIQUE,
+                record TEXT NOT NULL
+            )
+        """)
+        rows = database.execute("SELECT sequence, item_id, record FROM history ORDER BY sequence").fetchall()
+        for sequence, old_item_id, encoded in rows:
+            record = json.loads(encoded)
+            capture_id = record.get("capture_id")
+            if not isinstance(capture_id, str) or not capture_id:
+                # Preserve legacy entries that predate capture IDs without
+                # inventing an image ID in their saved user-facing metadata.
+                capture_id = f"legacy-row:{sequence}:{old_item_id}"
+            database.execute(
+                "INSERT OR IGNORE INTO history_per_capture (sequence, capture_id, record) VALUES (?, ?, ?)",
+                (sequence, capture_id, encoded),
+            )
+        database.execute("DROP TABLE history")
+        database.execute("ALTER TABLE history_per_capture RENAME TO history")
 
     @contextmanager
     def _database(self):
@@ -134,17 +169,21 @@ class DashboardState:
             if stored.get("decision") in ("A", "B"):
                 if not stored.get("bin_name"):
                     stored["bin_name"] = self.bin_config.get_bin(stored["decision"]).name
-            if stored.get("decision") in ("A", "B") and not stored.get("dry_run", False):
-                item_id = stored.get("item_id") or stored.get("capture_id")
-                if not isinstance(item_id, str) or not item_id:
-                    raise ValueError("A sorted item needs an item_id or capture_id.")
+            if (stored.get("decision") in ("A", "B")
+                    and not stored.get("dry_run", False)
+                    and not stored.get("emergency", False)):
+                capture_id = stored.get("capture_id")
+                if not isinstance(capture_id, str) or not capture_id:
+                    raise ValueError("A sorted load needs a capture_id.")
                 encoded = json.dumps(stored, ensure_ascii=False, allow_nan=False)
                 with self._database() as database:
                     database.execute(
-                        """INSERT INTO history (item_id, record) VALUES (?, ?)
-                           ON CONFLICT(item_id) DO UPDATE SET record = excluded.record""",
-                        (item_id, encoded),
+                        "INSERT OR IGNORE INTO history (capture_id, record) VALUES (?, ?)",
+                        (capture_id, encoded),
                     )
+                    stored = json.loads(database.execute(
+                        "SELECT record FROM history WHERE capture_id = ?", (capture_id,)
+                    ).fetchone()[0])
             self._latest_result = stored
 
     def reset_history(self) -> None:

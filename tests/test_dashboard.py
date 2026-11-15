@@ -26,6 +26,7 @@ def item_record(item_id="item-1", capture_id="capture-1", decision="B", **extra)
         "reason": "Not clearly recyclable.",
         "additional_info": "",
         "dry_run": False,
+        "emergency": False,
         **extra,
     }
 
@@ -50,15 +51,28 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(len({epoch for _, epoch in claims}), 1)
         self.assertEqual(self.state.get_snapshot()["pending_note"], "")
 
-    def test_item_retries_update_one_history_item_and_its_counts(self):
+    def test_distinct_captures_count_separately_even_with_the_same_legacy_item_id(self):
         _, epoch = self.state.claim_next_item()
         self.state.record_result(item_record(), epoch)
         self.state.record_result(item_record(capture_id="capture-2", decision="A"), epoch)
         snapshot = self.state.get_snapshot()
-        self.assertEqual(snapshot["counts"], {"B": 0, "A": 1, "total": 1})
-        self.assertEqual(len(snapshot["items"]), 1)
-        self.assertEqual(snapshot["items"][0]["capture_id"], "capture-2")
+        self.assertEqual(snapshot["counts"], {"B": 1, "A": 1, "total": 2})
+        self.assertEqual(len(snapshot["items"]), 2)
+        self.assertEqual({record["capture_id"] for record in snapshot["items"]}, {"capture-1", "capture-2"})
         self.assertEqual(snapshot["latest_result"]["decision"], "A")
+
+    def test_redelivered_capture_preserves_its_first_route_and_combined_label(self):
+        _, epoch = self.state.claim_next_item()
+        original = item_record(decision="A", item="two aluminum cans", bin_name="Original recycling")
+        self.state.record_result(original, epoch)
+        self.state.record_result({**original, "decision": "B", "item": "paper cup", "bin_name": "Changed trash"}, epoch)
+        snapshot = self.state.get_snapshot()
+        self.assertEqual(snapshot["counts"], {"A": 1, "B": 0, "total": 1})
+        self.assertEqual(len(snapshot["items"]), 1)
+        self.assertEqual(snapshot["items"][0]["item"], "two aluminum cans")
+        self.assertEqual(snapshot["items"][0]["bin_name"], "Original recycling")
+        self.assertEqual(snapshot["latest_result"]["decision"], "A")
+        self.assertEqual(snapshot["latest_result"]["item"], "two aluminum cans")
 
     def test_capture_id_deduplicates_records_without_item_id(self):
         _, epoch = self.state.claim_next_item()
@@ -68,6 +82,7 @@ class DashboardStateTests(unittest.TestCase):
         self.state.record_result({**record, "reason": "Updated explanation."}, epoch)
         self.assertEqual(self.state.get_snapshot()["counts"]["total"], 1)
         self.assertEqual(len(self.state.get_snapshot()["items"]), 1)
+        self.assertEqual(self.state.get_snapshot()["items"][0]["reason"], record["reason"])
 
     def test_history_and_counts_survive_restart(self):
         _, epoch = self.state.claim_next_item()
@@ -84,7 +99,13 @@ class DashboardStateTests(unittest.TestCase):
 
     def test_legacy_history_keeps_original_labels_when_current_bins_have_custom_names(self):
         self.state.close()
-        with sqlite3.connect(str(self.history_file)) as database:
+        legacy_file = Path(self.directory.name) / "legacy.sqlite3"
+        with sqlite3.connect(str(legacy_file)) as database:
+            database.execute("""CREATE TABLE history (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id TEXT NOT NULL UNIQUE,
+                record TEXT NOT NULL
+            )""")
             for item_id, decision in [("old-recycling", "recycle"), ("old-trash", "trash")]:
                 record = item_record(item_id=item_id, capture_id=item_id, decision=decision)
                 database.execute("INSERT INTO history (item_id, record) VALUES (?, ?)", (item_id, json.dumps(record)))
@@ -93,7 +114,7 @@ class DashboardStateTests(unittest.TestCase):
                   BinDefinition("B", "Reuse", ("Working parts.",))),
             fallback_bin="A", hold_rules=(),
         )
-        self.state = DashboardState(self.history_file, custom)
+        self.state = DashboardState(legacy_file, custom)
         snapshot = self.state.get_snapshot()
         self.assertEqual(snapshot["counts"], {"A": 1, "B": 1, "total": 2})
         records = {record["item_id"]: record for record in snapshot["items"]}
@@ -105,9 +126,12 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(latest["bin_name"], "Repair")
 
 
-    def test_hold_empty_and_dry_run_results_do_not_count_as_sorted_items(self):
+    def test_emergency_and_processing_statuses_do_not_count_as_sorted_items(self):
         _, epoch = self.state.claim_next_item()
-        for record in [item_record(decision="hold"), item_record(decision="empty"),
+        for record in [item_record(decision="hold", emergency=True), item_record(decision="empty"),
+                       item_record(decision="error"), item_record(decision="discarded"),
+                       item_record(decision="A", emergency=True),
+                       item_record(decision="preview", dry_run=True),
                        item_record(decision="A", dry_run=True)]:
             with self.subTest(record=record):
                 self.state.record_result(record, epoch)
@@ -116,6 +140,7 @@ class DashboardStateTests(unittest.TestCase):
                 self.assertEqual(snapshot["items"], [])
                 self.assertEqual(snapshot["latest_result"]["decision"], record["decision"])
                 self.assertEqual(snapshot["latest_result"]["dry_run"], record["dry_run"])
+                self.assertEqual(snapshot["latest_result"]["emergency"], record["emergency"])
 
     def test_reset_preserves_pending_note_and_discards_in_flight_result(self):
         _, old_epoch = self.state.claim_next_item()

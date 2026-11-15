@@ -3,25 +3,29 @@
     "A": {
       "name": "Recycling",
       "rules": [
-        "Accept only clearly recyclable items. Every accepted item must be visibly clean, dry, and empty.",
-        "Accept clean, dry, uncoated ordinary paper or cardboard without food or grease residue.",
-        "Accept empty, visibly clean metal food or beverage cans.",
-        "Accept empty, visibly clean glass bottles or jars, intact and without non-glass contents.",
-        "Accept empty, visibly clean rigid plastic food/drink bottles or containers only when a visible resin code identifies PET (#1) or HDPE (#2).",
-        "A recycling symbol alone does not establish acceptance. Do not infer invisible resin codes, cleanliness, or coatings. Visible food or liquid residue disqualifies an item."
+        "Use a permissive, practical recycling policy. Prefer this bin for recognizable recyclable-looking materials; ordinary appearance, labels, or context are enough to identify them.",
+        "Accept ordinary paper, cardboard, boxes, paper bags, paper cups, and cartons, including crumpled or torn items and lightly coated packaging.",
+        "Accept metal food or drink cans, foil, trays, and other small metal packaging.",
+        "Accept glass bottles and jars.",
+        "Accept common rigid plastic bottles, cups, tubs, trays, and food or drink containers of any usual plastic type. A visible recycling symbol, readable resin code, or proof of PET/HDPE is NOT required; use the item's recognizable appearance and context.",
+        "Mostly empty is sufficient. Minor food traces, a few liquid drops, light stains, dampness, or small grease marks do NOT disqualify an otherwise recyclable-looking load. Do not demand proof that every surface is perfectly clean, dry, and empty.",
+        "Attached labels, caps, tape, staples, light coatings, and tiny incidental nonrecyclable pieces are acceptable parts of the load; do not reject the whole load because of them. Clearly substantial food, pooled liquid, heavy soiling, or a substantial separate trash component still belongs in bin B.",
+        "Accept all electronics."
       ]
     },
     "B": {
       "name": "Trash",
       "rules": [
-        "Accept items not clearly accepted by bin A. When recyclability, material, cleanliness, or acceptance cannot be established, choose this bin.",
-        "Include dirty, greasy, or wet items, food, tissues, paper towels, coated or lined cups, plastic bags, films, wrappers, foam, ceramics, mirrors, and mixed-material packaging.",
-        "Do not assume an unreadable or hidden plastic code is #1 or #2."
+        "Use this bin for clear trash or genuinely unidentifiable material, rather than for small imperfections in otherwise recognizable recyclable-looking items.",
+        "Accept food and other organic waste, used tissues, napkins, paper towels, heavily soiled or food-filled packaging, plastic bags, flexible films and wrappers, foam, ceramics, and mirrors, unless an explicit bin A rule accepts the load.",
+        "Do not choose trash solely because a recycling logo or resin code is missing, the underside is hidden, a container is not perfectly dry, or there is minor residue, a label, a cap, tape, or a light coating. Those details are allowed by bin A.",
+        "Choose this fallback when the actual material remains genuinely unclear, the load contains substantial separate trash mixed with recyclables, or no bin A rule reasonably fits."
       ]
     }
   },
   "fallback_bin": "B",
   "hold_rules": [
-    "Hold hazardous objects for inspection rather than pushing them: batteries, electronics, chemicals, sharp broken glass, or chemical containers."
+    "Hold only for a visible, immediate, severe emergency: active fire, heavy smoke, dangerous sparking, a burning or actively venting battery, or a serious active chemical leak.",
+    "Do not hold merely because an item is uncertain, partly hidden, damaged, electronic, a battery, or a closed chemical container. Ignore incidental hands, arms, and other body parts; sort the actual item using the bin rules or fallback bin."
   ]
 }

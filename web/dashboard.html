@@ -82,7 +82,10 @@
     .badge { display:inline-block; max-width:100%; background:#f0f3ed; color:var(--muted); padding:3px 9px; font-size:11px; font-weight:600; border-radius:6px; overflow-wrap:anywhere; }
     .badge.bin-a { background:var(--teal-soft); color:var(--teal); }
     .badge.bin-b { background:var(--amber-soft); color:var(--amber); }
-    .badge.hold { background:#fbf0e6; color:#935a30; }
+    .badge.hold { background:#fce9e5; color:#a13d37; }
+    .badge.error { background:#fbf0e6; color:#935a30; }
+    .badge.discarded { background:#f0f3ed; color:var(--muted); }
+    .badge.preview { background:#edf0f8; color:#596789; }
     #latest-name { font-size:19px; font-weight:600; letter-spacing:-.3px; margin-top:13px; overflow-wrap:anywhere; }
     #latest-reason { color:var(--muted); font-size:12px; margin-top:6px; overflow-wrap:anywhere; }
     #latest-meta { color:var(--muted); font-size:10px; margin-top:11px; }
@@ -163,12 +166,12 @@
         <section><h3 id="A-rules-title">Bin A</h3><ul id="A-rules"></ul></section>
         <section><h3 id="B-rules-title">Bin B</h3><ul id="B-rules"></ul></section>
       </div>
-      <div class="rules-footer"><p id="fallback-rule"></p><div id="hold-rules-section" hidden><h3>Hold for inspection</h3><ul id="hold-rules"></ul></div></div>
+      <div class="rules-footer"><p id="fallback-rule"></p><div id="hold-rules-section" hidden><h3>Emergency conditions</h3><ul id="hold-rules"></ul></div></div>
     </details>
 
     <div class="workspace">
       <section class="panel camera-panel" aria-labelledby="camera-title">
-        <div class="panel-heading"><div><h2 id="camera-title">Platform camera</h2><p class="subtle">One item at a time. Clear the platform between items.</p></div><span id="live-label" class="live"><span class="dot"></span><span id="live-text">Waiting</span></span></div>
+        <div class="panel-heading"><div><h2 id="camera-title">Platform camera</h2><p class="subtle">Each captured load counts as one item.</p></div><span id="live-label" class="live"><span class="dot"></span><span id="live-text">Waiting</span></span></div>
         <div class="feed">
           <img id="video" src="/video_feed" alt="Live overhead camera view of the sorting platform">
           <div id="feed-placeholder" class="feed-placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="3" y="6" width="18" height="14" rx="3"/><path d="m8 6 1-3h6l1 3"/><circle cx="12" cy="13" r="4"/></svg><span id="feed-message">Waiting for the camera feed…</span></div>
@@ -180,7 +183,7 @@
       <aside class="sidebar">
         <section class="panel note-panel" aria-labelledby="note-title">
           <div class="section-heading"><h2 id="note-title">Next item note</h2><span class="optional">Optional</span></div>
-          <p class="description">Add context before placing your next item. It stays with that item and is cleared for the following one.</p>
+          <p class="description">Add context before the next capture. It applies only to that captured load.</p>
           <form id="note-form">
             <label for="next-note">What should the sorter know?</label>
             <textarea id="next-note" maxlength="2000" placeholder="e.g. This item is made of coated paper." aria-describedby="note-help note-length"></textarea>
@@ -194,7 +197,7 @@
         <section class="panel latest-panel" aria-labelledby="latest-title">
           <div class="latest-heading"><h2 id="latest-title">Latest result</h2><span id="latest-decision" class="badge">Waiting</span></div>
           <p id="latest-name">Ready for the first item</p>
-          <p id="latest-reason">Start with an empty platform, then place one item and let it settle.</p>
+          <p id="latest-reason">Start with an empty platform, then add a load and let it settle.</p>
           <p id="latest-meta"></p>
         </section>
       </aside>
@@ -214,7 +217,8 @@
     'use strict';
     const el = (id) => document.getElementById(id);
     const number = new Intl.NumberFormat();
-    const labels = { hold: 'Hold', empty: 'Empty platform' };
+    const labels = { hold: 'Emergency hold', empty: 'Empty platform', error: 'Classification error', discarded: 'Outdated result', preview: 'Preview only' };
+    const operationalTitles = { error: 'Classification unavailable', discarded: 'Waiting for a fresh capture', preview: 'Capture saved' };
     let binConfig = { bins: {}, fallback_bin: 'B', hold_rules: [] };
     let lastConfig = '';
     let lastHistory = '';
@@ -226,7 +230,7 @@
     let stateRevision = 0;
 
     function text(value, fallback = '') { return value == null ? fallback : String(value); }
-    function decisionClass(decision) { return decision === 'A' ? 'bin-a' : decision === 'B' ? 'bin-b' : decision === 'hold' ? 'hold' : ''; }
+    function decisionClass(decision) { return decision === 'A' ? 'bin-a' : decision === 'B' ? 'bin-b' : ['hold', 'error', 'discarded', 'preview'].includes(decision) ? decision : ''; }
     function decisionLabel(decision, savedName) {
       if (decision === 'A' || decision === 'B') {
         const definition = binConfig.bins[decision] || {};
@@ -313,12 +317,12 @@
       const encoded = JSON.stringify(result);
       if (encoded === lastResult) return;
       lastResult = encoded;
-      const decision = result ? result.decision : '';
+      const decision = result ? (result.dry_run ? 'preview' : result.emergency === true ? 'hold' : result.decision) : '';
       el('latest-decision').className = `badge ${decisionClass(decision)}`;
-      el('latest-decision').textContent = result && result.dry_run ? 'Dry run' : (result ? decisionLabel(decision, result.bin_name) : 'Waiting');
-      el('latest-name').textContent = result ? text(result.item, 'Unknown item') : 'Ready for the first item';
-      el('latest-reason').textContent = result ? text(result.reason) : 'Start with an empty platform, then place one item and let it settle.';
-      el('latest-meta').textContent = result ? [result.material, `${confidence(result.confidence)} confidence`, timeLabel(result.captured_at)].filter(Boolean).join(' · ') : '';
+      el('latest-decision').textContent = result ? decisionLabel(decision, result.bin_name) : 'Waiting';
+      el('latest-name').textContent = result ? (operationalTitles[decision] || text(result.item, 'Unknown item')) : 'Ready for the first item';
+      el('latest-reason').textContent = result ? text(result.reason) : 'Start with an empty platform, then add a load and let it settle.';
+      el('latest-meta').textContent = result ? (operationalTitles[decision] ? timeLabel(result.captured_at) : [result.material, `${confidence(result.confidence)} confidence`, timeLabel(result.captured_at)].filter(Boolean).join(' · ')) : '';
     }
     function render(state) {
       renderBinRules(state.bin_config);

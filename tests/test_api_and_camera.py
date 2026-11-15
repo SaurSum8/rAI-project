@@ -23,9 +23,11 @@ from camera_sorter import (
     Classification,
     ChangeDetector,
     DEFAULT_MODEL,
+    ProcessingResult,
     build_prompt,
     classify_image,
     crop_frame,
+    processing_result,
     run_camera,
 )
 
@@ -38,6 +40,7 @@ class ClassificationContractTests(unittest.TestCase):
             "material": "aluminum",
             "confidence": 0.95,
             "reason": "The clean metal can meets the policy.",
+            "emergency": False,
         }
         self.requests = []
 
@@ -91,11 +94,16 @@ class ClassificationContractTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(encoded), b"test-jpeg")
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertTrue(request["text"]["format"]["strict"])
+        schema = request["text"]["format"]["schema"]
+        self.assertIn("emergency", schema["required"])
+        self.assertEqual(schema["properties"]["emergency"]["type"], "boolean")
+        self.assertEqual(set(schema["properties"]["decision"]["enum"]), {"A", "B", "hold", "empty"})
 
     def test_low_confidence_primary_bin_is_changed_to_default_fallback(self):
         self.classification["confidence"] = 0.74
         result = self.classify()
         self.assertEqual(result.decision, "B")
+        self.assertEqual(result.confidence, 0.74)
         self.assertIn("75%", result.reason)
 
     def test_confidence_threshold_is_inclusive(self):
@@ -104,7 +112,9 @@ class ClassificationContractTests(unittest.TestCase):
 
     def test_low_confidence_default_fallback_bin_is_preserved(self):
         self.classification.update(decision="B", confidence=0.2)
-        self.assertEqual(self.classify().decision, "B")
+        result = self.classify()
+        self.assertEqual(result.decision, "B")
+        self.assertEqual(result.confidence, 0.2)
 
     def test_custom_fallback_applies_without_assuming_a_recycling_direction(self):
         custom = BinConfig(
@@ -115,8 +125,8 @@ class ClassificationContractTests(unittest.TestCase):
         self.classification.update(decision="B", confidence=0.3)
         self.assertEqual(self.classify(bin_config=custom).decision, "A")
 
-    def test_new_response_schema_rejects_legacy_decision_names(self):
-        for old_decision in ("recycle", "trash"):
+    def test_classifier_schema_rejects_legacy_and_processing_decisions(self):
+        for old_decision in ("recycle", "trash", "error", "discarded", "preview"):
             with self.subTest(decision=old_decision):
                 self.classification["decision"] = old_decision
                 with self.assertRaises(ValidationError):
@@ -132,12 +142,85 @@ class ClassificationContractTests(unittest.TestCase):
         for expected in ("Repair", "Reuse", "Damaged components accepted.", "Working components accepted."):
             self.assertIn(expected, prompt)
         self.assertNotIn("recycl", prompt.lower())
-        self.assertNotIn("batter", prompt.lower())
         self.assertNotIn("food/liquid", prompt.lower())
 
-    def test_operational_hold_is_preserved(self):
-        self.classification.update(decision="hold", confidence=0.2, reason="A hand obscures the item.")
-        self.assertEqual(self.classify().decision, "hold")
+    def test_non_emergency_hold_uses_configured_fallback_without_inflating_confidence(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
+                  BinDefinition("B", "Reuse", ("Working components.",))),
+            fallback_bin="A", hold_rules=(),
+        )
+        for config, expected in [(None, "B"), (custom, "A")]:
+            with self.subTest(fallback=expected):
+                self.classification.update(decision="hold", confidence=0.2, emergency=False,
+                                           reason="A hand partly obscures the item.")
+                result = self.classify(bin_config=config)
+                self.assertEqual(result.decision, expected)
+                self.assertEqual(result.item, self.classification["item"])
+                self.assertEqual(result.material, self.classification["material"])
+                self.assertEqual(result.confidence, 0.2)
+                self.assertFalse(result.emergency)
+                self.assertIn("fallback", result.reason.lower())
+
+    def test_true_emergency_forces_hold_even_if_model_selected_a_bin(self):
+        for reported_decision in ("hold", "A", "B"):
+            with self.subTest(reported_decision=reported_decision):
+                self.classification.update(decision=reported_decision, emergency=True, confidence=0.2,
+                                           reason="Visible flames require immediate intervention.")
+                result = self.classify()
+                self.assertEqual(result.decision, "hold")
+                self.assertTrue(result.emergency)
+                self.assertEqual(result.confidence, 0.2)
+
+    def test_classifier_requires_explicit_emergency_assessment(self):
+        del self.classification["emergency"]
+        with self.assertRaises(ValidationError):
+            self.classify()
+
+    def test_processing_outcomes_are_not_emergency_classifications(self):
+        for decision in ("error", "discarded", "preview"):
+            with self.subTest(decision=decision):
+                result = processing_result(decision, "Operational status.")
+                self.assertIsInstance(result, ProcessingResult)
+                self.assertEqual(result.decision, decision)
+                self.assertFalse(result.emergency)
+                self.assertEqual(result.confidence, 0)
+                with self.assertRaises(ValidationError):
+                    ProcessingResult(**{**result.model_dump(), "emergency": True})
+
+    def test_prompt_excludes_body_parts_and_reserves_hold_for_visible_emergencies(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
+                  BinDefinition("B", "Reuse", ("Working components.",))),
+            fallback_bin="B", hold_rules=(),
+        )
+        prompt = " ".join(build_prompt(custom).lower().split())
+        self.assertRegex(prompt, r"ignore (?:incidental )?hands")
+        self.assertIn("arms", prompt)
+        self.assertIn("body parts", prompt)
+        self.assertIn("if only body parts", prompt)
+        self.assertIn("return empty", prompt)
+        self.assertIn("low confidence are not emergencies", prompt)
+        self.assertIn("hold: use only for an immediate", prompt)
+        self.assertIn("mere presence of a battery", prompt)
+        self.assertIn("does not establish an emergency", prompt)
+        self.assertIn("report confidence honestly", prompt)
+        self.assertIn("do not inflate", prompt)
+
+    def test_prompt_assigns_all_objects_in_one_image_to_one_combined_load(self):
+        custom = BinConfig(
+            bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
+                  BinDefinition("B", "Reuse", ("Working components.",))),
+            fallback_bin="B", hold_rules=(),
+        )
+        prompt = " ".join(build_prompt(custom).lower().split())
+        self.assertIn("entire load", prompt)
+        self.assertIn("one item for counting", prompt)
+        self.assertIn("every component", prompt)
+        self.assertIn("mixed contents with conflicting destinations", prompt)
+        self.assertIn("configured fallback bin", prompt)
+        self.assertIn("label should briefly name the whole load", prompt)
+        self.assertNotIn("focus on the main item", prompt)
 
     def test_refusal_never_produces_a_routing_decision(self):
         with self.assertRaises(RuntimeError):
@@ -217,23 +300,25 @@ class CameraIntegrationTests(unittest.TestCase):
             self.assertEqual(len(records), 2)
             self.assertNotEqual(records[0]["capture_id"], records[1]["capture_id"])
             for record in records:
-                self.assertEqual(record["decision"], "hold")
+                self.assertEqual(record["decision"], "preview")
+                self.assertFalse(record["emergency"])
                 self.assertTrue(record["dry_run"])
                 self.assertIsNone(record["model"])
+                self.assertEqual(record["item_id"], record["capture_id"])
                 image_path = Path(record["image_path"])
                 self.assertGreater(image_path.stat().st_size, 0)
                 self.assertEqual(json.loads(image_path.with_suffix(".json").read_text()), record)
         camera.release.assert_called_once()
 
-    def test_async_results_ignore_motion_only_while_cooldown_is_active(self):
+    def test_captured_photo_result_remains_valid_when_the_live_scene_changes(self):
         custom = BinConfig(
             bins=(BinDefinition("A", "Repair", ("Damaged components.",)),
                   BinDefinition("B", "Reuse", ("Working components.",))),
             fallback_bin="B", hold_rules=(),
         )
-        cases = [(5, False, 1.3, "A"), (5, True, 1.3, "A"), (0, True, 1.3, "hold"),
-                 (5, False, 6.2, "A"), (5, True, 6.2, "hold")]
-        for cooldown, scene_changed, completion_time, expected in cases:
+        cases = [(5, False, 1.3), (5, True, 1.3), (0, True, 1.3),
+                 (5, False, 6.2), (5, True, 6.2)]
+        for cooldown, scene_changed, completion_time in cases:
             with self.subTest(cooldown=cooldown, scene_changed=scene_changed, completion_time=completion_time), \
                     tempfile.TemporaryDirectory() as directory:
                 last_frame = self.replacement if scene_changed else self.item
@@ -243,7 +328,7 @@ class CameraIntegrationTests(unittest.TestCase):
                                            [self.empty, self.item, self.item, last_frame]] + [(False, None)]
                 completed = Future()
                 completed.set_result(Classification(
-                    decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
+                    decision="A", item="can", material="metal", confidence=0.95, reason="Accepted.", emergency=False
                 ))
                 executor = Mock()
                 executor.submit.return_value = completed
@@ -258,9 +343,10 @@ class CameraIntegrationTests(unittest.TestCase):
                                    bin_config=custom)
                 records = [json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]["decision"], expected)
-                if expected == "A":
-                    self.assertEqual(records[0]["bin_name"], "Repair")
+                self.assertEqual(records[0]["decision"], "A")
+                self.assertFalse(records[0]["emergency"])
+                self.assertEqual(records[0]["bin_name"], "Repair")
+                self.assertEqual(records[0]["item_id"], records[0]["capture_id"])
                 executor.submit.assert_called_once()
                 camera.release.assert_called_once()
 
@@ -288,7 +374,7 @@ class CameraIntegrationTests(unittest.TestCase):
             camera.read.side_effect = read_frame
             completed = Future()
             completed.set_result(Classification(
-                decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
+                decision="A", item="can", material="metal", confidence=0.95, reason="Accepted.", emergency=False
             ))
             executor = Mock()
             executor.submit.return_value = completed
@@ -312,36 +398,63 @@ class CameraIntegrationTests(unittest.TestCase):
             finally:
                 state.close()
 
-    def test_stale_result_after_cooldown_retries_only_after_fresh_motion_settles(self):
-        camera = Mock()
-        camera.isOpened.return_value = True
-        frames = [self.empty, self.item, self.item, self.item, self.item,
-                  self.item, self.replacement, self.replacement, self.replacement]
-        camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
-        result = Classification(
-            decision="A", item="can", material="metal", confidence=0.95, reason="Accepted."
-        )
-        delayed = Mock()
-        delayed.done.side_effect = [False, False, False, True]
-        delayed.result.return_value = result
-        completed = Future()
-        completed.set_result(result)
-        executor = Mock()
-        executor.submit.side_effect = [delayed, completed]
-        output = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory:
-            with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
-                    patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
-                    patch("camera_sorter.time.monotonic", side_effect=[0, 0, 0.1, 1.2, 2, 6.2, 7.3, 7.4, 8.5, 8.6]), \
-                    patch("camera_sorter.time.sleep"), \
-                    contextlib.redirect_stdout(output):
-                with self.assertRaises(RuntimeError):
-                    run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy")
-        records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual([record["decision"] for record in records], ["hold", "A"])
-        self.assertEqual(executor.submit.call_count, 2)
+    def test_delayed_photo_result_counts_its_source_load_even_after_recalibration(self):
+        for recalibrate in (False, True):
+            with self.subTest(recalibrate=recalibrate), tempfile.TemporaryDirectory() as directory:
+                state = DashboardState(Path(directory) / "history.sqlite3")
+                if recalibrate:
+                    frames = [self.empty, self.item, self.item, self.empty, self.replacement]
+                    clock = [0, 0, 0.1, 1.2, 2, 2.1]
+                    completion_checks = [False, True]
+                else:
+                    frames = [self.empty, self.item, self.item, self.item,
+                              self.item, self.item, self.replacement]
+                    clock = [0, 0, 0.1, 1.2, 2, 6.2, 7.3, 7.4]
+                    completion_checks = [False, False, False, True]
+                frame_iterator = iter(enumerate(frames))
 
-    def test_failed_api_attempt_emits_hold_without_retrying_unchanged_scene(self):
+                def read_frame():
+                    try:
+                        index, frame = next(frame_iterator)
+                    except StopIteration:
+                        return False, None
+                    if recalibrate and index == 3:
+                        state.request_recalibration()
+                    return True, frame
+
+                camera = Mock()
+                camera.isOpened.return_value = True
+                camera.read.side_effect = read_frame
+                delayed = Mock()
+                delayed.done.side_effect = completion_checks
+                delayed.result.return_value = Classification(
+                    decision="A", item="can", material="metal", confidence=0.95,
+                    reason="Accepted source image.", emergency=False,
+                )
+                executor = Mock()
+                executor.submit.return_value = delayed
+                output = io.StringIO()
+                try:
+                    with patch("camera_sorter.cv2.VideoCapture", return_value=camera), \
+                            patch("camera_sorter.ThreadPoolExecutor", return_value=executor), \
+                            patch("camera_sorter.time.monotonic", side_effect=clock), \
+                            patch("camera_sorter.time.sleep"), \
+                            patch.object(state, "publish_frame"), \
+                            contextlib.redirect_stdout(output):
+                        with self.assertRaisesRegex(RuntimeError, "stopped returning frames"):
+                            run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy", state)
+                    records = [json.loads(line) for line in output.getvalue().splitlines()]
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["decision"], "A")
+                    self.assertEqual(records[0]["item_id"], records[0]["capture_id"])
+                    self.assertEqual(state.get_snapshot()["counts"], {"A": 1, "B": 0, "total": 1})
+                    self.assertEqual(state.get_snapshot()["items"][0]["capture_id"], records[0]["capture_id"])
+                    executor.submit.assert_called_once()
+                    camera.release.assert_called_once()
+                finally:
+                    state.close()
+
+    def test_failed_api_attempt_emits_error_without_retrying_unchanged_scene(self):
         camera = Mock()
         camera.isOpened.return_value = True
         frames = [self.empty, self.item, self.item, self.item, self.item, self.item]
@@ -362,44 +475,40 @@ class CameraIntegrationTests(unittest.TestCase):
                     run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy")
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["decision"], "hold")
+        self.assertEqual(records[0]["decision"], "error")
+        self.assertFalse(records[0]["emergency"])
         executor.submit.assert_called_once()
 
-    def test_item_retry_keeps_note_and_identity_until_empty_platform_starts_next_item(self):
+    def test_each_captured_load_gets_its_own_count_and_note_without_an_empty_platform(self):
+        batch = self.item.copy()
+        batch[105:140, 25:65] = 255
+        frames = [self.empty, batch, batch, batch, batch,
+                  self.replacement, self.replacement, self.replacement]
+        clock = [0, 0, 0.1, 1.2, 1.3, 6.2, 6.3, 7.4, 7.5]
         camera = Mock()
         camera.isOpened.return_value = True
-        frames = [self.empty, self.item, self.item, self.empty, self.empty,
-                  self.item, self.item, self.replacement, self.replacement, self.replacement,
-                  self.empty, self.empty, self.empty, self.empty,
-                  self.item, self.item, self.item]
         camera.read.side_effect = [(True, frame) for frame in frames] + [(False, None)]
-        clock = [0, 0, 0.1, 1.2, 2, 3.1, 6.2, 7.3, 7.4, 8.5, 8.6,
-                 9, 10.1, 13.5, 14.6, 15, 16.1, 16.2]
         output = io.StringIO()
         submitted_notes = []
         with tempfile.TemporaryDirectory() as directory:
             state = DashboardState(Path(directory) / "history.sqlite3")
-            state.set_next_note("First item: clean aluminum can.")
+            state.set_next_note("First captured load: two clean aluminum cans.")
 
             def complete_request(function, client, jpeg, model, prompt, min_confidence,
                                  additional_info="", bin_config=None):
                 submitted_notes.append(additional_info)
-                if len(submitted_notes) == 1:
-                    state.set_next_note("Second item: wax-lined cup.")
-                classification = Classification(
-                    decision="B" if len(submitted_notes) == 3 else "A",
-                    item="cup" if len(submitted_notes) == 3 else "can",
-                    material="paper" if len(submitted_notes) == 3 else "metal",
+                first = len(submitted_notes) == 1
+                if first:
+                    state.set_next_note("Second captured load: wax-lined cup.")
+                future = Future()
+                future.set_result(Classification(
+                    decision="A" if first else "B",
+                    item="two aluminum cans" if first else "paper cup",
+                    material="metal" if first else "lined paper",
                     confidence=0.95,
-                    reason="Classified with the item's note.",
-                )
-                if len(submitted_notes) == 1:
-                    future = Mock()
-                    future.done.side_effect = [False, False, False, False, True]
-                    future.result.return_value = classification
-                else:
-                    future = Future()
-                    future.set_result(classification)
+                    reason="Classified the entire captured load.",
+                    emergency=False,
+                ))
                 return future
 
             executor = Mock()
@@ -416,18 +525,20 @@ class CameraIntegrationTests(unittest.TestCase):
                         run_camera(self.args(directory, dry_run=False), ChangeDetector(), Mock(), "policy", state)
                 self.assertEqual(claim.call_count, 2)
                 self.assertEqual(submitted_notes, [
-                    "First item: clean aluminum can.",
-                    "First item: clean aluminum can.",
-                    "Second item: wax-lined cup.",
+                    "First captured load: two clean aluminum cans.",
+                    "Second captured load: wax-lined cup.",
                 ])
                 records = [json.loads(line) for line in output.getvalue().splitlines()]
-                self.assertEqual([record["decision"] for record in records], ["hold", "A", "B"])
-                self.assertEqual(records[0]["item_id"], records[1]["item_id"])
-                self.assertNotEqual(records[1]["item_id"], records[2]["item_id"])
+                self.assertEqual([record["decision"] for record in records], ["A", "B"])
+                self.assertEqual(records[0]["item"], "two aluminum cans")
+                self.assertNotEqual(records[0]["capture_id"], records[1]["capture_id"])
+                self.assertTrue(all(record["item_id"] == record["capture_id"] for record in records))
                 self.assertEqual([record["additional_info"] for record in records], submitted_notes)
                 snapshot = state.get_snapshot()
                 self.assertEqual(snapshot["counts"], {"B": 1, "A": 1, "total": 2})
+                self.assertEqual(len(snapshot["items"]), 2)
                 self.assertEqual(snapshot["pending_note"], "")
+                self.assertEqual(executor.submit.call_count, 2)
             finally:
                 state.close()
 
